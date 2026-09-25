@@ -94,8 +94,13 @@ scale), lightgbm (MIT), joblib, pytest.
     `source1_entity_id, matched_entity_ids` (string, may be empty).
   - `parse_id_list(cell: str) -> list[str]` — splits a comma-separated cell,
     returns `[]` for empty/NaN.
-  - `join_id_list(ids: list[str]) -> str` — sorts, dedupes, joins with `,`.
-    Raises `ValueError` if any id appears more than once in the input.
+  - `join_id_list(ids: list[str]) -> str` — sorts, dedupes (via `set()`),
+    joins with `,`. Silent dedupe, not an exception: legitimate call sites
+    (blocking-strategy union, per-entity match assignment) can hand it a
+    list with incidental repeats, and the binding output constraint is "no
+    duplicate IDs in the output list" — dedupe satisfies that regardless of
+    input, where raising would make the pipeline brittle against a benign
+    overlap.
   - `write_id_mapping_tsv(rows: dict[str, list[str]], path: str, id_col: str, list_col: str) -> None` —
     writes one row per key of `rows`, tab-separated, using `join_id_list`
     for the list column. Used for both `matching_results.tsv` (id_col=

@@ -233,6 +233,56 @@ the point blocking needs a unified other-source frame, not earlier.
 `utils/validate_submission.py` automatically, so format errors are caught
 locally before spending a leaderboard submission.
 
+## Scale redesign addendum (2026-09-25, post final-review)
+
+Final whole-branch review measured actual join/memory sizes against the real
+dataset and found the original design (Task 4/5's doc-frequency cap alone)
+insufficient: token-overlap blocking produced a 1.62B-row join, address-prefix
+blocking had no cap at all (153M-row join, one prefix alone producing 43M
+rows), and the India embedding partition needed ~18GB against ~10GB
+available. Given the challenge's 5-submissions/day cap and limited remaining
+time, embedding-based blocking is deferred rather than fixed for memory —
+token+address blocking alone already covers most PS-named noise patterns
+(abbreviations, word-order transpositions, component reordering, missing
+PIN/state); embeddings only add recall on severe typos/transliteration, and
+a working, correctly-formatted submission now outweighs chasing that
+marginal recall today.
+
+Changes:
+1. **Blocking gets per-S1 top-K, not just a doc-freq cap**, on both token-
+   overlap and address-prefix (address-prefix previously had no cap — a real
+   gap in the original design, not just an under-tuned constant). Per-token
+   weight `1/log(doc_freq+2)` (reusing doc-freq already computed for the
+   cap, not a TF-IDF refit); sum matched-token weights per (S1, candidate)
+   pair; keep top-K per S1 entity (default K=30 per strategy). Processed in
+   batches of S1 entities (default 50k) so peak memory per batch is bounded
+   regardless of total row count.
+2. **Embedding-based blocking (`embedding_knn_candidates`) is not called by
+   default** for now — `generate_candidates`'s `embedder` param stays
+   optional and unused in the default inference/training path. The function
+   itself stays in `blocking.py`, tested, for a later fallback-only pass
+   (querying only S1 entities that got zero candidates from the other two
+   strategies) once a first submission is in.
+3. **Shared chunked featurizer.** One `featurize_pairs()` in `features.py`
+   used by both `train.py` and `infer.py`, processing pairs in chunks
+   (default 1-2M), writing to arrays incrementally. Source tables get
+   `norm_name`/`norm_addr` columns computed once (not per-pair) via
+   `utils_io`, closing the "88% of feature time is redundant
+   normalization" finding.
+4. **`embedding_cosine` dropped from `feature_columns`** — it was dead at
+   inference (always 0.0, blocking discarded its vectors) and risked a
+   silent train/serve mismatch if ever wired up carelessly. The other four
+   signals (Levenshtein, Jaccard, numeric-overlap, structural) plus
+   country-match remain.
+5. **Non-Latin business names**: `normalize.py` swaps its ASCII-fold step
+   for `anyascii` (MIT-licensed) transliteration — the fold was measured
+   dropping ~10% of Source-2 names to `""` entirely, a real recall hole for
+   non-Latin-script (e.g. India-sourced) names.
+6. **Cheap fixes**: `run_inference` loads the model artifact before running
+   blocking (fail fast on a bad `--model-path`, not after hours of work);
+   `others_df` is built once and passed through rather than re-concatenated
+   inside `generate_candidates`.
+
 ## Resolved items
 
 - `dataset/train/*.tsv`, `dataset/test/*.tsv`, `utils/validate_submission.py`,
