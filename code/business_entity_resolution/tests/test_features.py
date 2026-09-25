@@ -121,3 +121,36 @@ def test_build_pair_features_merges_all_feature_groups():
     assert "country_match" in feats and feats["country_match"] == 1
     assert "name_length_diff" in feats
     assert "embedding_cosine" in feats and feats["embedding_cosine"] == 1.0
+
+
+import pandas as pd
+from src.features import featurize_pairs
+
+
+def test_featurize_pairs_chunking_matches_unchunked_output_with_no_lost_or_duplicated_rows():
+    s1 = pd.DataFrame([
+        {"entity_id": f"S1-{i:05d}", "business_name": f"Acme {i}", "business_address": f"{i} Main St", "country": "US"}
+        for i in range(5)
+    ])
+    others = pd.DataFrame([
+        {"entity_id": f"S2-{i:05d}", "business_name": f"Acme {i} Inc", "business_address": f"{i} Main Street", "country": "US"}
+        for i in range(5)
+    ])
+    pairs = pd.DataFrame([
+        {"source1_entity_id": f"S1-{i:05d}", "other_entity_id": f"S2-{i:05d}", "label": i % 2}
+        for i in range(5)
+    ])
+
+    chunked = featurize_pairs(pairs, s1, others, chunk_size=2)
+    unchunked = featurize_pairs(pairs, s1, others, chunk_size=1000)
+
+    assert len(chunked) == 5
+    assert len(chunked) == len(unchunked)
+
+    chunked_sorted = chunked.sort_values("source1_entity_id").reset_index(drop=True)
+    unchunked_sorted = unchunked.sort_values("source1_entity_id").reset_index(drop=True)
+
+    assert list(chunked_sorted["source1_entity_id"]) == list(pairs["source1_entity_id"])
+    assert list(chunked_sorted["other_entity_id"]) == list(pairs["other_entity_id"])
+    assert list(chunked_sorted["label"]) == list(pairs["label"])
+    pd.testing.assert_frame_equal(chunked_sorted, unchunked_sorted)

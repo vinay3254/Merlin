@@ -1,5 +1,6 @@
 import re
 
+import pandas as pd
 from rapidfuzz import fuzz
 
 from src.normalize import normalize_text, tokenize
@@ -99,3 +100,47 @@ def build_pair_features(name_a, addr_a, country_a, name_b, addr_b, country_b, em
     feats.update(structural_features(name_a, name_b, addr_a, addr_b))
     feats.update(embedding_cosine_features(embed_a, embed_b))
     return feats
+
+
+def featurize_pairs(pairs_df, s1_df, others_df, embed_lookup=None, chunk_size=1_000_000) -> pd.DataFrame:
+    """
+    Chunked, memory-bounded featurization. Merges pairs_df against s1_df/others_df
+    and computes build_pair_features per row, processing chunk_size rows of
+    pairs_df at a time so peak memory stays bounded regardless of total pair count.
+    Preserves every column already in pairs_df (e.g. "label" if present) plus one
+    column per feature key from build_pair_features.
+    """
+    if pairs_df.empty:
+        return pairs_df.copy()
+
+    s1_renamed = s1_df.rename(columns={
+        "entity_id": "source1_entity_id", "business_name": "name_a",
+        "business_address": "addr_a", "country": "country_a",
+    })[["source1_entity_id", "name_a", "addr_a", "country_a"]]
+    others_renamed = others_df.rename(columns={
+        "entity_id": "other_entity_id", "business_name": "name_b",
+        "business_address": "addr_b", "country": "country_b",
+    })[["other_entity_id", "name_b", "addr_b", "country_b"]]
+
+    chunk_frames = []
+    for start in range(0, len(pairs_df), chunk_size):
+        chunk = pairs_df.iloc[start:start + chunk_size]
+        merged = chunk.merge(s1_renamed, on="source1_entity_id").merge(others_renamed, on="other_entity_id")
+
+        feature_rows = []
+        for row in merged.itertuples():
+            embed_a = embed_lookup.get(row.source1_entity_id) if embed_lookup else None
+            embed_b = embed_lookup.get(row.other_entity_id) if embed_lookup else None
+            feats = build_pair_features(
+                row.name_a, row.addr_a, row.country_a,
+                row.name_b, row.addr_b, row.country_b,
+                embed_a=embed_a, embed_b=embed_b,
+            )
+            feature_rows.append(feats)
+
+        feat_df = pd.DataFrame(feature_rows)
+        for col in pairs_df.columns:
+            feat_df[col] = merged[col].values
+        chunk_frames.append(feat_df)
+
+    return pd.concat(chunk_frames, ignore_index=True)

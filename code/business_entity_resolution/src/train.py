@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 
-from src.features import build_pair_features
+from src.features import featurize_pairs
 from src.metrics import macro_f_beta
 from src.utils_io import parse_id_list
 
@@ -39,31 +39,7 @@ def build_feature_matrix(pairs_df, s1_df, others_df, embed_lookup=None) -> pd.Da
     if pairs_df.empty:
         return pd.DataFrame(columns=["source1_entity_id", "other_entity_id", "label"])
 
-    s1_renamed = s1_df.rename(columns={
-        "entity_id": "source1_entity_id", "business_name": "name_a",
-        "business_address": "addr_a", "country": "country_a",
-    })[["source1_entity_id", "name_a", "addr_a", "country_a"]]
-    others_renamed = others_df.rename(columns={
-        "entity_id": "other_entity_id", "business_name": "name_b",
-        "business_address": "addr_b", "country": "country_b",
-    })[["other_entity_id", "name_b", "addr_b", "country_b"]]
-
-    merged = pairs_df.merge(s1_renamed, on="source1_entity_id").merge(others_renamed, on="other_entity_id")
-
-    feature_rows = []
-    for row in merged.itertuples():
-        embed_a = embed_lookup.get(row.source1_entity_id) if embed_lookup else None
-        embed_b = embed_lookup.get(row.other_entity_id) if embed_lookup else None
-        feats = build_pair_features(
-            row.name_a, row.addr_a, row.country_a,
-            row.name_b, row.addr_b, row.country_b,
-            embed_a=embed_a, embed_b=embed_b,
-        )
-        feats["source1_entity_id"] = row.source1_entity_id
-        feats["other_entity_id"] = row.other_entity_id
-        feats["label"] = row.label
-        feature_rows.append(feats)
-    return pd.DataFrame(feature_rows)
+    return featurize_pairs(pairs_df, s1_df, others_df, embed_lookup=embed_lookup)
 
 
 def train_model(feature_matrix_df, feature_columns) -> LGBMClassifier:

@@ -78,6 +78,23 @@ def test_run_inference_writes_row_for_every_source1_entity_including_singletons(
     assert "S1-00001" in candidates_text
 
 
+def test_generate_candidates_uses_passed_others_df_instead_of_deriving_it():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "Acme Traders", "business_address": "123 Main St", "country": "US"}])
+    s2 = _df([{"entity_id": "S2-00001", "business_name": "Acme Traders Inc", "business_address": "999 Other Rd", "country": "US"}])
+    s3 = _df([{"entity_id": "S3-00001", "business_name": "Nothing Alike", "business_address": "123 Main Street", "country": "US"}])
+
+    # Deliberately different from pd.concat([s2, s3]): only contains an entity
+    # that isn't in s2 or s3 at all, with a name that overlaps s1's tokens.
+    filtered_others = _df([{"entity_id": "S9-00001", "business_name": "Acme Traders Co", "business_address": "1 Elsewhere Ave", "country": "US"}])
+
+    result = generate_candidates(s1, s2, s3, embedder=None, others_df=filtered_others)
+
+    # Only the passed-in others_df's entity should appear; s2/s3 ids should not,
+    # proving generate_candidates used the passed others_df rather than
+    # re-deriving pd.concat([s2, s3]) internally.
+    assert result["S1-00001"] == {"S9-00001"}
+
+
 def test_run_inference_missing_dataset_file_fails_fast(tmp_path):
     dataset_dir = tmp_path / "test"
     dataset_dir.mkdir()
