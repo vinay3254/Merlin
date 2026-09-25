@@ -59,15 +59,19 @@ def test_token_overlap_candidates_excludes_tokens_over_max_doc_freq():
     assert result["S1-00001"] == {"S2-00001"}
 
 
+_EMBED_VOCAB = {}
+
+
 def _fake_embedder(texts):
     # deterministic stub: identical texts -> identical vectors, no network/model needed
     vectors = []
     for t in texts:
         key = t.strip().lower()
-        # Use hash to create consistent vector across calls
-        idx = hash(key) % 8
-        vec = np.zeros(8)
-        vec[idx] = 1.0
+        if key not in _EMBED_VOCAB:
+            _EMBED_VOCAB[key] = len(_EMBED_VOCAB)
+        idx = _EMBED_VOCAB[key]
+        vec = np.zeros(64)
+        vec[idx % 64] = 1.0
         vectors.append(vec)
     return np.array(vectors)
 
