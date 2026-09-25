@@ -1,5 +1,6 @@
+import numpy as np
 import pandas as pd
-from src.blocking import build_token_index, token_overlap_candidates, address_prefix_candidates
+from src.blocking import build_token_index, token_overlap_candidates, address_prefix_candidates, embedding_knn_candidates, union_candidates, candidates_to_rows
 
 
 def _df(rows):
@@ -56,3 +57,51 @@ def test_token_overlap_candidates_excludes_tokens_over_max_doc_freq():
     result = token_overlap_candidates(s1, other, max_doc_freq=2)
     # "acme" is over-cap (freq=3 > 2) and contributes nothing; "traders" (freq=1) still matches S2-00001
     assert result["S1-00001"] == {"S2-00001"}
+
+
+def _fake_embedder(texts):
+    # deterministic stub: identical texts -> identical vectors, no network/model needed
+    vectors = []
+    for t in texts:
+        key = t.strip().lower()
+        # Use hash to create consistent vector across calls
+        idx = hash(key) % 8
+        vec = np.zeros(8)
+        vec[idx] = 1.0
+        vectors.append(vec)
+    return np.array(vectors)
+
+
+def test_embedding_knn_candidates_matches_identical_text():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "acme traders", "business_address": "123 main st", "country": "US"}])
+    s2 = _df([{"entity_id": "S2-00001", "business_name": "acme traders", "business_address": "123 main st", "country": "US"}])
+    result = embedding_knn_candidates(s1, s2, embedder=_fake_embedder, top_k=5, min_sim=0.99)
+    assert result["S1-00001"] == {"S2-00001"}
+
+
+def test_embedding_knn_candidates_respects_min_sim_threshold():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "alpha", "business_address": "", "country": "US"}])
+    s2 = _df([{"entity_id": "S2-00001", "business_name": "zzz completely different", "business_address": "", "country": "US"}])
+    result = embedding_knn_candidates(s1, s2, embedder=_fake_embedder, top_k=5, min_sim=0.99)
+    assert result["S1-00001"] == set()
+
+
+def test_union_candidates_merges_and_dedupes():
+    a = {"S1-00001": {"S2-00001", "S2-00002"}}
+    b = {"S1-00001": {"S2-00002", "S3-00001"}}
+    merged = union_candidates(a, b)
+    assert merged["S1-00001"] == {"S2-00001", "S2-00002", "S3-00001"}
+
+
+def test_union_candidates_handles_key_present_in_only_one_dict():
+    a = {"S1-00001": {"S2-00001"}}
+    b = {"S1-00002": {"S3-00001"}}
+    merged = union_candidates(a, b)
+    assert merged["S1-00001"] == {"S2-00001"}
+    assert merged["S1-00002"] == {"S3-00001"}
+
+
+def test_candidates_to_rows_produces_sorted_lists():
+    union = {"S1-00001": {"S2-00002", "S2-00001"}}
+    rows = candidates_to_rows(union)
+    assert rows["S1-00001"] == ["S2-00001", "S2-00002"]
