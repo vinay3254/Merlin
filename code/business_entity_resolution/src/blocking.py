@@ -10,7 +10,10 @@ STOPWORDS = {
     "limited", "ltd", "company", "co", "private", "pvt", "llc", "llp",
 }
 
-MAX_TOKEN_DOC_FREQ = 5000
+MAX_TOKEN_DOC_FREQ = 500
+MAX_ADDRESS_PREFIX_DOC_FREQ = 500
+TOP_K_PER_STRATEGY = 30
+S1_BATCH_SIZE = 50_000
 
 
 def _name_tokens_table(df, id_col_name: str, text_col: str = "business_name") -> pd.DataFrame:
@@ -31,24 +34,65 @@ def build_token_index(df, id_col="entity_id", text_col="business_name") -> dict:
     return index
 
 
-def token_overlap_candidates(s1_df, other_df, max_doc_freq: int = MAX_TOKEN_DOC_FREQ) -> dict:
-    s1_tokens = _name_tokens_table(s1_df, id_col_name="entity_id_s1")
-    other_tokens = _name_tokens_table(other_df, id_col_name="entity_id_other")
+def _weighted_top_k_candidates(
+    s1_key_table,      # DataFrame with columns ["entity_id_s1", "key"] -- long format, one row per (entity, key) pair
+    other_key_table,   # DataFrame with columns ["entity_id_other", "key"], NOT yet capped
+    max_doc_freq,
+    top_k=TOP_K_PER_STRATEGY,
+    batch_size=S1_BATCH_SIZE,
+) -> dict:
+    """
+    Generic per-S1 top-K candidate selection shared by both blocking
+    strategies. Weights each key by 1/log(doc_freq_in_other + 2) (reusing
+    the doc-frequency already computed for the cap -- not a TF-IDF refit),
+    sums matched-key weight per (s1, other) pair, and keeps only the
+    top_k highest-weighted candidates per S1 entity. Processes S1 entities
+    in batches so peak memory per merge is bounded regardless of total
+    row count -- a hot key otherwise still produces (batch s1-rows with
+    that key) x (other rows with that key) per batch, so max_doc_freq
+    must be applied to `other_key_table` before any merge, not after.
+    """
+    if s1_key_table.empty or other_key_table.empty:
+        return {}
 
-    doc_freq = other_tokens["token"].value_counts()
-    allowed_tokens = set(doc_freq[doc_freq <= max_doc_freq].index)
-    other_tokens = other_tokens[other_tokens["token"].isin(allowed_tokens)]
+    doc_freq = other_key_table["key"].value_counts()
+    allowed_keys = set(doc_freq[doc_freq <= max_doc_freq].index)
+    capped_other = other_key_table[other_key_table["key"].isin(allowed_keys)]
+    if capped_other.empty:
+        return {}
+
+    weights = 1.0 / np.log(doc_freq[doc_freq <= max_doc_freq] + 2)
+    weight_map = weights.to_dict()
+
+    s1_ids = s1_key_table["entity_id_s1"].unique()
+    result = {}
+    for start in range(0, len(s1_ids), batch_size):
+        batch_ids = set(s1_ids[start:start + batch_size])
+        batch_keys = s1_key_table[s1_key_table["entity_id_s1"].isin(batch_ids)]
+        merged = batch_keys.merge(capped_other, on="key")
+        if merged.empty:
+            continue
+        merged["weight"] = merged["key"].map(weight_map)
+        scored = merged.groupby(["entity_id_s1", "entity_id_other"])["weight"].sum().reset_index()
+        scored = scored.sort_values("weight", ascending=False)
+        top = scored.groupby("entity_id_s1", sort=False).head(top_k)
+        for s1_id, group in top.groupby("entity_id_s1"):
+            result[s1_id] = set(group["entity_id_other"])
+    return result
+
+
+def token_overlap_candidates(
+    s1_df,
+    other_df,
+    max_doc_freq: int = MAX_TOKEN_DOC_FREQ,
+    top_k: int = TOP_K_PER_STRATEGY,
+    batch_size: int = S1_BATCH_SIZE,
+) -> dict:
+    s1_tokens = _name_tokens_table(s1_df, id_col_name="entity_id_s1").rename(columns={"token": "key"})
+    other_tokens = _name_tokens_table(other_df, id_col_name="entity_id_other").rename(columns={"token": "key"})
 
     result = {eid: set() for eid in s1_df["entity_id"]}
-    if s1_tokens.empty or other_tokens.empty:
-        return result
-
-    merged = s1_tokens.merge(other_tokens, on="token")
-    if merged.empty:
-        return result
-
-    grouped = merged.groupby("entity_id_s1")["entity_id_other"].agg(set)
-    result.update(grouped.to_dict())
+    result.update(_weighted_top_k_candidates(s1_tokens, other_tokens, max_doc_freq, top_k, batch_size))
     return result
 
 
@@ -60,20 +104,20 @@ def _address_prefix_key_table(df, id_col_name: str, prefix_len: int) -> pd.DataF
     return table.dropna(subset=["prefix"])
 
 
-def address_prefix_candidates(s1_df, other_df, prefix_len: int = 3) -> dict:
+def address_prefix_candidates(
+    s1_df,
+    other_df,
+    prefix_len: int = 3,
+    max_doc_freq: int = MAX_ADDRESS_PREFIX_DOC_FREQ,
+    top_k: int = TOP_K_PER_STRATEGY,
+    batch_size: int = S1_BATCH_SIZE,
+) -> dict:
     result = {eid: set() for eid in s1_df["entity_id"]}
 
-    s1_keys = _address_prefix_key_table(s1_df, "entity_id_s1", prefix_len)
-    other_keys = _address_prefix_key_table(other_df, "entity_id_other", prefix_len)
-    if s1_keys.empty or other_keys.empty:
-        return result
+    s1_keys = _address_prefix_key_table(s1_df, "entity_id_s1", prefix_len).rename(columns={"prefix": "key"})
+    other_keys = _address_prefix_key_table(other_df, "entity_id_other", prefix_len).rename(columns={"prefix": "key"})
 
-    merged = s1_keys.merge(other_keys, on="prefix")
-    if merged.empty:
-        return result
-
-    grouped = merged.groupby("entity_id_s1")["entity_id_other"].agg(set)
-    result.update(grouped.to_dict())
+    result.update(_weighted_top_k_candidates(s1_keys, other_keys, max_doc_freq, top_k, batch_size))
     return result
 
 
