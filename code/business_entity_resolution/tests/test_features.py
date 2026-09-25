@@ -59,3 +59,65 @@ def test_name_address_string_features_returns_all_keys():
 def test_numeric_token_overlap_handles_nan_without_raising():
     assert numeric_token_overlap(float("nan"), "123 Main St") == 0.0
     assert numeric_token_overlap(float("nan"), float("nan")) == 0.0
+
+
+import numpy as np
+from src.features import (
+    country_match,
+    structural_features,
+    embedding_cosine_features,
+    build_pair_features,
+)
+
+
+def test_country_match_exact_and_case_insensitive():
+    assert country_match("US", "us") == 1
+    assert country_match("India", "US") == 0
+
+
+def test_country_match_handles_unseen_country_value_like_france():
+    assert country_match("France", "France") == 1
+    assert country_match("France", "US") == 0
+
+
+def test_country_match_empty_is_zero():
+    assert country_match("", "US") == 0
+    assert country_match("", "") == 0
+
+
+def test_country_match_handles_nan_without_raising():
+    assert country_match(float("nan"), "US") == 0
+    assert country_match("US", float("nan")) == 0
+    assert country_match(float("nan"), float("nan")) == 0
+
+
+def test_structural_features_computes_diffs():
+    from src.normalize import normalize_text
+    feats = structural_features("Acme Corp", "Acme", "123 Main St", "123 Main")
+    # Normalized: "Acme Corp" -> "acme corporation", "Acme" -> "acme"
+    norm_a = normalize_text("Acme Corp")
+    norm_b = normalize_text("Acme")
+    assert feats["name_length_diff"] == abs(len(norm_a) - len(norm_b))
+    assert feats["name_token_count_diff"] >= 0
+
+
+def test_embedding_cosine_features_handles_none_vectors():
+    assert embedding_cosine_features(None, None)["embedding_cosine"] == 0.0
+
+
+def test_embedding_cosine_features_computes_dot_product():
+    a = np.array([1.0, 0.0])
+    b = np.array([1.0, 0.0])
+    assert embedding_cosine_features(a, b)["embedding_cosine"] == 1.0
+
+
+def test_build_pair_features_merges_all_feature_groups():
+    feats = build_pair_features(
+        "Acme Corp", "123 Main St", "US",
+        "Acme Corporation", "123 Main Street", "US",
+        embed_a=np.array([1.0, 0.0]), embed_b=np.array([1.0, 0.0]),
+    )
+    assert "name_levenshtein" in feats
+    assert "country_match" in feats and feats["country_match"] == 1
+    assert "name_length_diff" in feats
+    assert "embedding_cosine" in feats and feats["embedding_cosine"] == 1.0

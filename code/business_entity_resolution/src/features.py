@@ -65,3 +65,37 @@ def name_address_string_features(name_a, addr_a, name_b, addr_b) -> dict:
         "addr_sorted_token_match": sorted_tokens_exact_match(addr_tokens_a, addr_tokens_b),
         "addr_numeric_overlap": numeric_token_overlap(addr_a, addr_b),
     }
+
+
+def country_match(country_a, country_b) -> int:
+    a = _safe_text(country_a).strip().lower()
+    b = _safe_text(country_b).strip().lower()
+    if not a or not b:
+        return 0
+    return int(a == b)
+
+
+def structural_features(name_a, name_b, addr_a, addr_b) -> dict:
+    norm_name_a, norm_name_b = normalize_text(name_a), normalize_text(name_b)
+    norm_addr_a, norm_addr_b = normalize_text(addr_a), normalize_text(addr_b)
+    return {
+        "name_length_diff": abs(len(norm_name_a) - len(norm_name_b)),
+        "name_token_count_diff": abs(len(tokenize(norm_name_a)) - len(tokenize(norm_name_b))),
+        "addr_length_diff": abs(len(norm_addr_a) - len(norm_addr_b)),
+        "addr_token_count_diff": abs(len(tokenize(norm_addr_a)) - len(tokenize(norm_addr_b))),
+    }
+
+
+def embedding_cosine_features(vec_a, vec_b) -> dict:
+    if vec_a is None or vec_b is None:
+        return {"embedding_cosine": 0.0}
+    return {"embedding_cosine": float(vec_a @ vec_b)}
+
+
+def build_pair_features(name_a, addr_a, country_a, name_b, addr_b, country_b, embed_a=None, embed_b=None) -> dict:
+    feats = {}
+    feats.update(name_address_string_features(name_a, addr_a, name_b, addr_b))
+    feats["country_match"] = country_match(country_a, country_b)
+    feats.update(structural_features(name_a, name_b, addr_a, addr_b))
+    feats.update(embedding_cosine_features(embed_a, embed_b))
+    return feats
