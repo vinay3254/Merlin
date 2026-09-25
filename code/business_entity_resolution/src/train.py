@@ -1,9 +1,13 @@
+import os
 import random
 
+import joblib
+import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 
 from src.features import build_pair_features
+from src.metrics import macro_f_beta
 from src.utils_io import parse_id_list
 
 
@@ -66,3 +70,47 @@ def train_model(feature_matrix_df, feature_columns) -> LGBMClassifier:
     model = LGBMClassifier(n_estimators=200, max_depth=6, random_state=42)
     model.fit(feature_matrix_df[feature_columns], feature_matrix_df["label"])
     return model
+
+
+def split_train_validation(s1_df, val_frac: float = 0.2, seed: int = 42):
+    ids = list(s1_df["entity_id"])
+    rng = random.Random(seed)
+    shuffled = ids[:]
+    rng.shuffle(shuffled)
+    val_size = max(1, round(len(ids) * val_frac)) if len(ids) >= 2 else 0
+    val_ids = sorted(shuffled[:val_size])
+    train_ids = sorted(shuffled[val_size:])
+    return train_ids, val_ids
+
+
+def tune_threshold(scored_pairs_df, ground_truth_df, thresholds=None) -> float:
+    if thresholds is None:
+        thresholds = np.arange(0.1, 1.0, 0.05)
+
+    gt_map = {
+        s1_id: set(parse_id_list(matched))
+        for s1_id, matched in zip(ground_truth_df["source1_entity_id"], ground_truth_df["matched_entity_ids"])
+    }
+
+    best_threshold = thresholds[0]
+    best_score = -1.0
+    for threshold in thresholds:
+        above = scored_pairs_df[scored_pairs_df["score"] >= threshold]
+        grouped = above.groupby("source1_entity_id")["other_entity_id"].agg(set).to_dict()
+        predictions = {s1_id: grouped.get(s1_id, set()) for s1_id in gt_map}
+        score = macro_f_beta(predictions, gt_map)
+        if score >= best_score:
+            best_score = score
+            best_threshold = threshold
+    return float(best_threshold)
+
+
+def save_model_artifact(model, threshold: float, feature_columns: list, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    joblib.dump({"model": model, "threshold": threshold, "feature_columns": feature_columns}, path)
+
+
+def load_model_artifact(path: str) -> dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No model artifact found at {path}. Run train.py first.")
+    return joblib.load(path)

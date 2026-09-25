@@ -70,3 +70,61 @@ def test_train_model_fits_without_error_on_small_matrix():
     model = train_model(matrix, feature_columns=["name_levenshtein", "addr_levenshtein", "country_match"])
     preds = model.predict_proba(matrix[["name_levenshtein", "addr_levenshtein", "country_match"]])
     assert preds.shape == (4, 2)
+
+
+import os
+import pytest
+from src.train import (
+    split_train_validation,
+    tune_threshold,
+    save_model_artifact,
+    load_model_artifact,
+)
+
+
+def test_split_train_validation_no_overlap_and_covers_all_ids():
+    s1 = _df({"entity_id": [f"S1-{i:05d}" for i in range(10)]})
+    train_ids, val_ids = split_train_validation(s1, val_frac=0.2, seed=42)
+    assert set(train_ids) & set(val_ids) == set()
+    assert set(train_ids) | set(val_ids) == set(s1["entity_id"])
+    assert len(val_ids) == 2
+
+
+def test_split_train_validation_is_deterministic_for_fixed_seed():
+    s1 = _df({"entity_id": [f"S1-{i:05d}" for i in range(10)]})
+    a = split_train_validation(s1, val_frac=0.2, seed=42)
+    b = split_train_validation(s1, val_frac=0.2, seed=42)
+    assert a == b
+
+
+def test_tune_threshold_picks_threshold_that_maximizes_f_beta():
+    # true match S2-00001 scores 0.9, false candidate S2-00002 scores 0.4
+    scored = _df([
+        {"source1_entity_id": "S1-00001", "other_entity_id": "S2-00001", "score": 0.9},
+        {"source1_entity_id": "S1-00001", "other_entity_id": "S2-00002", "score": 0.4},
+    ])
+    gt = _df([{"source1_entity_id": "S1-00001", "matched_entity_ids": "S2-00001"}])
+    best = tune_threshold(scored, gt)
+    assert 0.4 < best <= 0.9
+
+
+def test_save_and_load_model_artifact_roundtrip(tmp_path):
+    matrix = _df([
+        {"f1": 1.0, "label": 1},
+        {"f1": 0.0, "label": 0},
+        {"f1": 0.9, "label": 1},
+        {"f1": 0.1, "label": 0},
+    ])
+    model = train_model(matrix, feature_columns=["f1"])
+    path = str(tmp_path / "model.joblib")
+    save_model_artifact(model, threshold=0.55, feature_columns=["f1"], path=path)
+    artifact = load_model_artifact(path)
+    assert artifact["threshold"] == 0.55
+    assert artifact["feature_columns"] == ["f1"]
+    assert hasattr(artifact["model"], "predict_proba")
+
+
+def test_load_model_artifact_missing_file_raises_clear_error(tmp_path):
+    missing = tmp_path / "no_model.joblib"
+    with pytest.raises(FileNotFoundError, match=str(missing)):
+        load_model_artifact(str(missing))
