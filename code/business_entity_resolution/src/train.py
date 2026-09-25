@@ -127,8 +127,14 @@ def run_training(dataset_dir: str, model_path: str, use_embeddings: bool = False
     # "Scale redesign addendum". Passing use_embeddings=True is a no-op,
     # not an error.
     embedder = None
-    train_candidates = generate_candidates(train_s1, s2_df, s3_df, embedder=embedder, others_df=others_df)
-    val_candidates = generate_candidates(val_s1, s2_df, s3_df, embedder=embedder, others_df=others_df)
+    # Block once against the full s1_df rather than separately against
+    # train_s1 and val_s1: the expensive part of blocking (tokenizing and
+    # indexing others_df) is identical either way, so blocking per-split
+    # would rebuild that shared index twice for no benefit. Split the
+    # resulting candidates dict by id membership instead.
+    all_candidates = generate_candidates(s1_df, s2_df, s3_df, embedder=embedder, others_df=others_df)
+    train_candidates = {s1_id: all_candidates[s1_id] for s1_id in train_ids}
+    val_candidates = {s1_id: all_candidates[s1_id] for s1_id in val_ids}
 
     train_gt = ground_truth_df[ground_truth_df["source1_entity_id"].isin(train_ids)]
     val_gt = ground_truth_df[ground_truth_df["source1_entity_id"].isin(val_ids)]

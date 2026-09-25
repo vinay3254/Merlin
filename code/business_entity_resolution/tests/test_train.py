@@ -130,52 +130,90 @@ def test_load_model_artifact_missing_file_raises_clear_error(tmp_path):
         load_model_artifact(str(missing))
 
 
-def test_run_training_end_to_end_on_small_synthetic_dataset(tmp_path):
+def test_run_training_end_to_end_on_small_synthetic_dataset(tmp_path, monkeypatch):
+    import src.train as train_module
     from src.train import run_training
 
     dataset_dir = tmp_path / "train"
     dataset_dir.mkdir()
 
-    # 5 source-1 entities: 3 have real matches spread across source2/source3,
-    # 2 are singletons with no match anywhere. With val_frac=0.2, seed=42 this
-    # deterministically splits into train=[S1-00001, S1-00002, S1-00003, S1-00005]
-    # and val=[S1-00004], so both the train and validation splits exercise a
-    # real positive match as well as a singleton.
+    # 10 source-1 entities: 6 have real matches spread across source2/source3,
+    # 4 are singletons with no match anywhere. With val_frac=0.3, seed=42 this
+    # deterministically splits into
+    #   train = [S1-00001, S1-00002, S1-00005, S1-00006, S1-00007, S1-00009, S1-00010]
+    #   val   = [S1-00003, S1-00004, S1-00008]
+    # (verified directly via split_train_validation), giving 3 validation
+    # entities with a mix of matched (S1-00003, S1-00008) and unmatched
+    # (S1-00004) outcomes, instead of the previous single-validation-entity
+    # setup that couldn't exercise a train/val leakage regression.
     (dataset_dir / "train_source1.tsv").write_text(
         "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
         "S1-00001\tAcme Traders\t123 Main St\tUS\n"
         "S1-00002\tZephyr Corp\t55 Oak Ave\tUS\n"
-        "S1-00003\tSolo Business\t1 Lonely Rd\tUS\n"
-        "S1-00004\tBright Sun LLC\t22 Sun Blvd\tUS\n"
-        "S1-00005\tQuiet Moon Co\t9 Moon St\tUS\n"
+        "S1-00003\tBright Sun LLC\t22 Sun Blvd\tUS\n"
+        "S1-00004\tQuiet Moon Co\t9 Moon St\tUS\n"
+        "S1-00005\tSolo Business\t1 Lonely Rd\tUS\n"
+        "S1-00006\tFalcon Freight\t77 Falcon Way\tUS\n"
+        "S1-00007\tWandering Star\t3 Star Ln\tUS\n"
+        "S1-00008\tGolden Gate Traders\t4 Gate Rd\tUS\n"
+        "S1-00009\tSilent Harbor\t8 Harbor Dr\tUS\n"
+        "S1-00010\tCrimson Peak Co\t12 Peak Ave\tUS\n"
     )
     (dataset_dir / "train_source2.tsv").write_text(
         "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
         "S2-00001\tAcme Traders Inc\t123 Main Street\tUS\n"
         "S2-00002\tBright Sun\t22 Sun Boulevard\tUS\n"
-        "S2-00003\tCompletely Unrelated\t999 Nowhere Ave\tUS\n"
+        "S2-00003\tGolden Gate Trading\t4 Gate Road\tUS\n"
     )
     (dataset_dir / "train_source3.tsv").write_text(
         "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
         "S3-00001\tZephyr Corporation\t55 Oak Avenue\tUS\n"
-        "S3-00002\tAnother Unrelated Place\t1 Nowhere Blvd\tUS\n"
+        "S3-00002\tFalcon Freight Co\t77 Falcon Way\tUS\n"
+        "S3-00003\tCrimson Peak\t12 Peak Avenue\tUS\n"
     )
     (dataset_dir / "train_ground_truth.tsv").write_text(
         "source1_entity_id\tmatched_entity_ids\n"
         "S1-00001\tS2-00001\n"
         "S1-00002\tS3-00001\n"
-        "S1-00003\t\n"
-        "S1-00004\tS2-00002\n"
+        "S1-00003\tS2-00002\n"
+        "S1-00004\t\n"
         "S1-00005\t\n"
+        "S1-00006\tS3-00002\n"
+        "S1-00007\t\n"
+        "S1-00008\tS2-00003\n"
+        "S1-00009\t\n"
+        "S1-00010\tS3-00003\n"
     )
 
+    # Spy on build_feature_matrix (called only for the training split's
+    # pairs) to capture which source1_entity_id values the training feature
+    # matrix actually contains, so we can assert none of them belong to the
+    # validation split -- this is the leakage regression the previous test
+    # would have silently missed.
+    captured_train_s1_ids = {}
+    original_build_feature_matrix = train_module.build_feature_matrix
+
+    def spy_build_feature_matrix(pairs_df, s1_df, others_df, embed_lookup=None):
+        captured_train_s1_ids["ids"] = set(pairs_df["source1_entity_id"])
+        return original_build_feature_matrix(pairs_df, s1_df, others_df, embed_lookup=embed_lookup)
+
+    monkeypatch.setattr(train_module, "build_feature_matrix", spy_build_feature_matrix)
+
     model_path = tmp_path / "model.joblib"
-    summary = run_training(str(dataset_dir), str(model_path), val_frac=0.2, seed=42)
+    summary = run_training(str(dataset_dir), str(model_path), val_frac=0.3, seed=42)
 
     assert set(summary.keys()) == {"threshold", "n_train_pairs", "n_val_entities", "val_f_beta"}
+    assert summary["n_val_entities"] == 3
 
     artifact = load_model_artifact(str(model_path))
     assert hasattr(artifact["model"], "predict_proba")
 
     assert isinstance(summary["threshold"], float)
     assert 0.0 <= summary["threshold"] <= 1.0
+
+    val_ids = {"S1-00003", "S1-00004", "S1-00008"}
+    train_ids = {f"S1-{i:05d}" for i in range(1, 11)} - val_ids
+    train_pair_s1_ids = captured_train_s1_ids["ids"]
+    assert train_pair_s1_ids, "expected at least one training pair to be built"
+    assert train_pair_s1_ids <= train_ids
+    assert train_pair_s1_ids.isdisjoint(val_ids)
