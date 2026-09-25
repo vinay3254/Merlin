@@ -42,3 +42,17 @@ def test_address_prefix_candidates_matches_shared_prefix():
     s2 = _df([{"entity_id": "S2-00001", "business_name": "", "business_address": "123 MG Road Near SBI ATM", "country": "India"}])
     result = address_prefix_candidates(s1, s2, prefix_len=3)
     assert result["S1-00001"] == {"S2-00001"}
+
+
+def test_token_overlap_candidates_excludes_tokens_over_max_doc_freq():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "acme traders", "business_address": "", "country": "US"}])
+    # "acme" appears in 3 other-source rows -- over-cap when max_doc_freq=2
+    # "traders" appears in only 1 -- under-cap, should still match
+    other = _df([
+        {"entity_id": "S2-00001", "business_name": "acme traders", "business_address": "", "country": "US"},
+        {"entity_id": "S2-00002", "business_name": "acme corp", "business_address": "", "country": "US"},
+        {"entity_id": "S2-00003", "business_name": "acme logistics", "business_address": "", "country": "US"},
+    ])
+    result = token_overlap_candidates(s1, other, max_doc_freq=2)
+    # "acme" is over-cap (freq=3 > 2) and contributes nothing; "traders" (freq=1) still matches S2-00001
+    assert result["S1-00001"] == {"S2-00001"}
