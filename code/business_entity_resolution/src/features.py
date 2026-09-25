@@ -7,6 +7,13 @@ from src.normalize import normalize_text, tokenize
 _DIGIT_RE = re.compile(r"\d+")
 
 
+def _safe_text(text) -> str:
+    """Convert text to string, handling None and NaN safely."""
+    if text is None or (isinstance(text, float) and text != text):  # NaN != NaN
+        return ""
+    return text
+
+
 def levenshtein_ratio(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -34,8 +41,8 @@ def sorted_tokens_exact_match(a_tokens: list, b_tokens: list) -> int:
 
 
 def numeric_token_overlap(a_text: str, b_text: str) -> float:
-    a_nums = set(_DIGIT_RE.findall(a_text or ""))
-    b_nums = set(_DIGIT_RE.findall(b_text or ""))
+    a_nums = set(_DIGIT_RE.findall(_safe_text(a_text)))
+    b_nums = set(_DIGIT_RE.findall(_safe_text(b_text)))
     if not a_nums or not b_nums:
         return 0.0
     union = a_nums | b_nums

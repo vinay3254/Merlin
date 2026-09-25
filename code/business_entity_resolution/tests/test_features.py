@@ -54,3 +54,8 @@ def test_name_address_string_features_returns_all_keys():
     }
     assert set(feats.keys()) == expected_keys
     assert feats["name_exact_normalized_match"] == 1  # both normalize to "acme corporation"
+
+
+def test_numeric_token_overlap_handles_nan_without_raising():
+    assert numeric_token_overlap(float("nan"), "123 Main St") == 0.0
+    assert numeric_token_overlap(float("nan"), float("nan")) == 0.0
