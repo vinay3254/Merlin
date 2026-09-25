@@ -1,0 +1,8 @@
+pandas==2.2.3
+numpy==1.26.4
+rapidfuzz==3.10.1
+sentence-transformers==3.3.1
+faiss-cpu==1.9.0
+lightgbm==4.5.0
+joblib==1.4.2
+pytest==8.3.3
