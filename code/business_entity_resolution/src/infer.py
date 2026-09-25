@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 
 import pandas as pd
 
@@ -70,6 +72,21 @@ def assign_matches(scored_df: pd.DataFrame, threshold: float) -> dict:
     return result
 
 
+def maybe_run_validator(output_dir: str, test_dir: str, validator_path: str):
+    if not os.path.exists(validator_path):
+        return None
+    result = subprocess.run(
+        [
+            sys.executable, validator_path,
+            "--matching", os.path.join(output_dir, "matching_results.tsv"),
+            "--candidate", os.path.join(output_dir, "candidate_pairs.tsv"),
+            "--test-dir", test_dir,
+        ],
+        capture_output=True, text=True,
+    )
+    return result.stdout + result.stderr
+
+
 def run_inference(dataset_dir: str, model_path: str, output_dir: str, use_embeddings: bool = True) -> None:
     s1_df = read_source_tsv(os.path.join(dataset_dir, "test_source1.tsv"))
     s2_df = read_source_tsv(os.path.join(dataset_dir, "test_source2.tsv"))
@@ -97,3 +114,9 @@ def run_inference(dataset_dir: str, model_path: str, output_dir: str, use_embedd
         matches, os.path.join(output_dir, "matching_results.tsv"),
         id_col="source1_entity_id", list_col="matched_entity_ids",
     )
+
+    validator_output = maybe_run_validator(
+        output_dir, dataset_dir, os.path.join(os.path.dirname(dataset_dir), "..", "utils", "validate_submission.py")
+    )
+    if validator_output:
+        print(validator_output)
