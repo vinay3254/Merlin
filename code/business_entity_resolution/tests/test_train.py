@@ -45,6 +45,21 @@ def test_build_feature_matrix_produces_one_row_per_pair_with_feature_columns():
     assert matrix.iloc[0]["label"] == 1
 
 
+def test_build_training_pairs_caps_negatives_per_positive():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "Acme", "business_address": "", "country": "US"}])
+    others = _df([{"entity_id": f"S2-{i:05d}", "business_name": "Unrelated", "business_address": "", "country": "US"} for i in range(15)])
+    gt = _df([{"source1_entity_id": "S1-00001", "matched_entity_ids": ""}])  # no true positives
+    blocking_candidates = {"S1-00001": {f"S2-{i:05d}" for i in range(15)}}  # 15 candidates, all negatives
+
+    pairs = build_training_pairs(s1, others, gt, blocking_candidates, max_negatives_per_positive=2, seed=42)
+
+    # cap = 2 * max(1, 0 positives) = 2
+    assert (pairs["label"] == 0).sum() == 2
+    # sampled negatives must be a subset of the candidate pool
+    sampled_ids = set(pairs[pairs["label"] == 0]["other_entity_id"])
+    assert sampled_ids.issubset({f"S2-{i:05d}" for i in range(15)})
+
+
 def test_train_model_fits_without_error_on_small_matrix():
     matrix = _df([
         {"name_levenshtein": 1.0, "addr_levenshtein": 1.0, "country_match": 1, "label": 1},
