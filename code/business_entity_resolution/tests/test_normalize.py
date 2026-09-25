@@ -35,3 +35,7 @@ def test_tokenize_handles_empty_string():
 
 def test_abbreviation_map_is_lowercase_keys():
     assert all(k == k.lower() for k in ABBREVIATION_MAP)
+
+
+def test_normalize_handles_nan_without_becoming_literal_nan_token():
+    assert normalize_text(float("nan")) == ""

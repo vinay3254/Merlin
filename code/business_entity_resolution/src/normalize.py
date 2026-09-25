@@ -26,7 +26,7 @@ _WS_RE = re.compile(r"\s+")
 
 
 def normalize_text(text) -> str:
-    if not text:
+    if text is None or text == "" or (isinstance(text, float) and text != text):  # NaN != NaN
         return ""
     text = unicodedata.normalize("NFKD", str(text))
     text = text.encode("ascii", "ignore").decode("ascii")
