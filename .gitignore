@@ -32,6 +32,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Git worktrees (isolated implementation workspaces)
+.worktrees/
+
 # Testing & IDE
 .pytest_cache/
 .coverage
