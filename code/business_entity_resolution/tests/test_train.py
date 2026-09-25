@@ -128,3 +128,54 @@ def test_load_model_artifact_missing_file_raises_clear_error(tmp_path):
     missing = tmp_path / "no_model.joblib"
     with pytest.raises(FileNotFoundError, match=str(missing)):
         load_model_artifact(str(missing))
+
+
+def test_run_training_end_to_end_on_small_synthetic_dataset(tmp_path):
+    from src.train import run_training
+
+    dataset_dir = tmp_path / "train"
+    dataset_dir.mkdir()
+
+    # 5 source-1 entities: 3 have real matches spread across source2/source3,
+    # 2 are singletons with no match anywhere. With val_frac=0.2, seed=42 this
+    # deterministically splits into train=[S1-00001, S1-00002, S1-00003, S1-00005]
+    # and val=[S1-00004], so both the train and validation splits exercise a
+    # real positive match as well as a singleton.
+    (dataset_dir / "train_source1.tsv").write_text(
+        "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
+        "S1-00001\tAcme Traders\t123 Main St\tUS\n"
+        "S1-00002\tZephyr Corp\t55 Oak Ave\tUS\n"
+        "S1-00003\tSolo Business\t1 Lonely Rd\tUS\n"
+        "S1-00004\tBright Sun LLC\t22 Sun Blvd\tUS\n"
+        "S1-00005\tQuiet Moon Co\t9 Moon St\tUS\n"
+    )
+    (dataset_dir / "train_source2.tsv").write_text(
+        "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
+        "S2-00001\tAcme Traders Inc\t123 Main Street\tUS\n"
+        "S2-00002\tBright Sun\t22 Sun Boulevard\tUS\n"
+        "S2-00003\tCompletely Unrelated\t999 Nowhere Ave\tUS\n"
+    )
+    (dataset_dir / "train_source3.tsv").write_text(
+        "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
+        "S3-00001\tZephyr Corporation\t55 Oak Avenue\tUS\n"
+        "S3-00002\tAnother Unrelated Place\t1 Nowhere Blvd\tUS\n"
+    )
+    (dataset_dir / "train_ground_truth.tsv").write_text(
+        "source1_entity_id\tmatched_entity_ids\n"
+        "S1-00001\tS2-00001\n"
+        "S1-00002\tS3-00001\n"
+        "S1-00003\t\n"
+        "S1-00004\tS2-00002\n"
+        "S1-00005\t\n"
+    )
+
+    model_path = tmp_path / "model.joblib"
+    summary = run_training(str(dataset_dir), str(model_path), val_frac=0.2, seed=42)
+
+    assert set(summary.keys()) == {"threshold", "n_train_pairs", "n_val_entities", "val_f_beta"}
+
+    artifact = load_model_artifact(str(model_path))
+    assert hasattr(artifact["model"], "predict_proba")
+
+    assert isinstance(summary["threshold"], float)
+    assert 0.0 <= summary["threshold"] <= 1.0

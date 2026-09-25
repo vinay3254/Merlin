@@ -8,7 +8,7 @@ from lightgbm import LGBMClassifier
 
 from src.features import featurize_pairs
 from src.metrics import macro_f_beta
-from src.utils_io import parse_id_list
+from src.utils_io import parse_id_list, read_ground_truth, read_source_tsv
 
 
 def build_training_pairs(
@@ -90,3 +90,69 @@ def load_model_artifact(path: str) -> dict:
     if not os.path.exists(path):
         raise FileNotFoundError(f"No model artifact found at {path}. Run train.py first.")
     return joblib.load(path)
+
+
+EXCLUDED_FEATURE_COLUMNS = {"source1_entity_id", "other_entity_id", "label", "embedding_cosine"}
+# embedding_cosine is excluded deliberately: embedding-based blocking is not
+# used by default (deferred — see the spec's "Scale redesign addendum"), so
+# this column would be a constant 0.0 and add nothing but noise.
+
+
+def run_training(dataset_dir: str, model_path: str, use_embeddings: bool = False, val_frac: float = 0.2, seed: int = 42) -> dict:
+    """
+    Full training orchestration: load train data, generate candidates via
+    blocking, build training pairs, featurize, fit the model, tune the
+    decision threshold on a held-out validation split, save the artifact.
+    Returns a summary dict: {"threshold": float, "n_train_pairs": int,
+    "n_val_entities": int, "val_f_beta": float}.
+    """
+    # Imported lazily to avoid a circular import: src.infer imports from
+    # src.train (load_model_artifact), so src.train cannot import src.infer
+    # at module load time.
+    from src.infer import generate_candidates, score_candidates
+
+    s1_df = read_source_tsv(os.path.join(dataset_dir, "train_source1.tsv"))
+    s2_df = read_source_tsv(os.path.join(dataset_dir, "train_source2.tsv"))
+    s3_df = read_source_tsv(os.path.join(dataset_dir, "train_source3.tsv"))
+    ground_truth_df = read_ground_truth(os.path.join(dataset_dir, "train_ground_truth.tsv"))
+    others_df = pd.concat([s2_df, s3_df], ignore_index=True)
+
+    train_ids, val_ids = split_train_validation(s1_df, val_frac=val_frac, seed=seed)
+    train_s1 = s1_df[s1_df["entity_id"].isin(train_ids)]
+    val_s1 = s1_df[s1_df["entity_id"].isin(val_ids)]
+
+    # use_embeddings is accepted for future use but not wired to anything
+    # yet: embedding-based blocking is deliberately deferred (real-scale
+    # memory issues, sentence-transformers not installed) per the spec's
+    # "Scale redesign addendum". Passing use_embeddings=True is a no-op,
+    # not an error.
+    embedder = None
+    train_candidates = generate_candidates(train_s1, s2_df, s3_df, embedder=embedder, others_df=others_df)
+    val_candidates = generate_candidates(val_s1, s2_df, s3_df, embedder=embedder, others_df=others_df)
+
+    train_gt = ground_truth_df[ground_truth_df["source1_entity_id"].isin(train_ids)]
+    val_gt = ground_truth_df[ground_truth_df["source1_entity_id"].isin(val_ids)]
+
+    pairs_df = build_training_pairs(train_s1, others_df, train_gt, train_candidates)
+    feature_matrix = build_feature_matrix(pairs_df, train_s1, others_df)
+    feature_columns = [c for c in feature_matrix.columns if c not in EXCLUDED_FEATURE_COLUMNS]
+
+    model = train_model(feature_matrix, feature_columns)
+
+    val_scored = score_candidates(val_s1, others_df, val_candidates, model, feature_columns)
+    threshold = tune_threshold(val_scored, val_gt)
+
+    save_model_artifact(model, threshold, feature_columns, model_path)
+
+    val_gt_map = {row["source1_entity_id"]: set(parse_id_list(row["matched_entity_ids"])) for _, row in val_gt.iterrows()}
+    above = val_scored[val_scored["score"] >= threshold]
+    predictions = above.groupby("source1_entity_id")["other_entity_id"].agg(set).to_dict()
+    predictions = {s1_id: predictions.get(s1_id, set()) for s1_id in val_gt_map}
+    val_f_beta = macro_f_beta(predictions, val_gt_map)
+
+    return {
+        "threshold": threshold,
+        "n_train_pairs": len(feature_matrix),
+        "n_val_entities": len(val_ids),
+        "val_f_beta": val_f_beta,
+    }
