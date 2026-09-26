@@ -13,13 +13,14 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
-from src.normalize_v3 import address_tokens, is_non_latin, name_parts
+from src.normalize_v3 import address_tokens, is_non_latin, name_parts, name_skeletons
 
 _POSTAL_RE = re.compile(r"^\d{5,6}$")
 
 
 _GLUE_WORDS = {"and", "the", "of", "et", "de", "du", "des", "la", "le", "les", "l", "d"}
-_FIELDS = ("core", "legal", "nospace", "addr", "house", "postal", "numbers", "last_tok", "nonlatin")
+_FIELDS = ("core", "legal", "nospace", "addr", "house", "postal", "numbers", "last_tok", "nonlatin",
+           "skel", "addr_words")
 
 
 def _process_chunk(args):
@@ -38,6 +39,8 @@ def _process_chunk(args):
         cols["numbers"].append(" ".join(sorted(set(nums))))
         cols["last_tok"].append(atoks[-1] if atoks else "")
         cols["nonlatin"].append(is_non_latin(name))
+        cols["skel"].append(" ".join(name_skeletons(core)))
+        cols["addr_words"].append(" ".join(t for t in atoks if not t.isdigit()))
     return cols
 
 
@@ -92,7 +95,18 @@ def pair_features(s1: RecordTable, other: RecordTable, s1_pos: np.ndarray, other
         # Name of one side against the address of the other: catches S2/S3
         # names that are junk but whose address still carries the name.
         "name_a_in_addr_b": _cp(ca, ab, fuzz.partial_ratio),
+        # Script-independent name similarity (Indic-script vs English names).
+        "skel_token_set": _cp(s1.skel[s1_pos], other.skel[other_pos], fuzz.token_set_ratio),
+        "skel_ratio": _cp(s1.skel[s1_pos], other.skel[other_pos], fuzz.ratio),
+        # Street/city words only: separates "same street, different number"
+        # hard negatives from genuinely different addresses.
+        "addr_words_token_set": _cp(s1.addr_words[s1_pos], other.addr_words[other_pos], fuzz.token_set_ratio),
     }
+    num_a, num_b = s1.numbers[s1_pos], other.numbers[other_pos]
+    both_nums = _both_nonempty(num_a, num_b)
+    feats["numbers_equal"] = np.where(both_nums, (num_a == num_b).astype(np.float32), -1.0).astype(np.float32)
+    feats["numbers_ratio"] = np.where(both_nums, _cp(num_a, num_b, fuzz.ratio), -1.0).astype(np.float32)
+    feats["numbers_partial"] = np.where(both_nums, _cp(num_a, num_b, fuzz.partial_ratio), -1.0).astype(np.float32)
     ha, hb = s1.house[s1_pos], other.house[other_pos]
     feats["house_match"] = np.where(_both_nonempty(ha, hb), (ha == hb).astype(np.float32), -1.0).astype(np.float32)
     feats["house_ratio"] = np.where(_both_nonempty(ha, hb), _cp(ha, hb, fuzz.ratio), -1.0).astype(np.float32)
@@ -152,45 +166,45 @@ def chunk_features(s1: RecordTable, other: RecordTable, s1_pos, other_pos, other
     return feat
 
 
-def global_context_features(s1: RecordTable, other: RecordTable, s1_pos, other_pos, keep_rows=None, chunk: int = 10_000_000) -> pd.DataFrame:
+def iter_global_context(s1: RecordTable, other: RecordTable, s1_pos, other_pos, chunk: int = 10_000_000):
     """
-    Name/address context over the FULL candidate set. For each pair: how its
+    Yields (column_name, full-length float32 array) one column at a time:
+    name/address context over the FULL candidate set. For each pair: how its
     name (and address) similarity ranks among the other record's competing
     S1 entities and among the S1 entity's candidates, the gap to the best,
     and how many competing S1 entities have a near-identical name. This is
     what separates "identical name, empty address, and no other S1 entity
     carries that name" (a match) from "identical name shared by several S1
     entities" (ambiguous) -- model_v3 without it scored the former ~0.03.
-
-    keep_rows: if given, only these rows of the result are materialized
-    (the group statistics still see every pair).
+    Yielding per column keeps peak memory at a few full-length arrays.
     """
     n = len(s1_pos)
-    name_ts = np.empty(n, dtype=np.float32)
-    name_ns = np.empty(n, dtype=np.float32)
+    name_best = np.empty(n, dtype=np.float32)
     addr_ts = np.empty(n, dtype=np.float32)
     for start in range(0, n, chunk):
         sl = slice(start, start + chunk)
         a, b = s1_pos[sl], other_pos[sl]
-        name_ts[sl] = _cp(s1.core[a], other.core[b], fuzz.token_set_ratio)
-        name_ns[sl] = _cp(s1.nospace[a], other.nospace[b], fuzz.ratio)
+        name_best[sl] = np.maximum(
+            _cp(s1.core[a], other.core[b], fuzz.token_set_ratio),
+            _cp(s1.nospace[a], other.nospace[b], fuzz.ratio),
+        )
         addr_ts[sl] = _cp(s1.addr[a], other.addr[b], fuzz.token_set_ratio)
-    name_best = np.maximum(name_ts, name_ns)
-    del name_ts, name_ns
-    rows = slice(None) if keep_rows is None else keep_rows
-    out = {}
     for values, prefix in ((name_best, "gname"), (addr_ts, "gaddr")):
-        rank_o, gap_o, _ = _rank_gap(other_pos, values)
-        out[f"{prefix}_rank_in_other"] = rank_o[rows]
-        out[f"{prefix}_gap_in_other"] = gap_o[rows]
-        del rank_o, gap_o
-        rank_s, gap_s, _ = _rank_gap(s1_pos, values)
-        out[f"{prefix}_rank_in_s1"] = rank_s[rows]
-        out[f"{prefix}_gap_in_s1"] = gap_s[rows]
-        del rank_s, gap_s
+        for keys, suffix in ((other_pos, "other"), (s1_pos, "s1")):
+            rank, gap, _ = _rank_gap(keys, values)
+            yield f"{prefix}_rank_in_{suffix}", rank
+            del rank
+            yield f"{prefix}_gap_in_{suffix}", gap
+            del gap
+    del addr_ts
     near_identical = (name_best >= 90).astype(np.float32)
-    out["gname_n_near_identical_in_other"] = (
-        pd.Series(near_identical).groupby(other_pos).transform("sum").to_numpy(np.float32)[rows]
+    yield "gname_n_near_identical_in_other", (
+        pd.Series(near_identical).groupby(other_pos).transform("sum").to_numpy(np.float32)
     )
-    out["gname_best"] = name_best[rows]
-    return pd.DataFrame(out)
+    yield "gname_best", name_best
+
+
+def global_context_features(s1: RecordTable, other: RecordTable, s1_pos, other_pos, keep_rows=None, chunk: int = 10_000_000) -> pd.DataFrame:
+    """DataFrame form of iter_global_context; keep_rows limits which rows are materialized."""
+    rows = slice(None) if keep_rows is None else keep_rows
+    return pd.DataFrame({name: values[rows] for name, values in iter_global_context(s1, other, s1_pos, other_pos, chunk)})

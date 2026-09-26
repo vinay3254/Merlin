@@ -23,7 +23,9 @@ import numpy as np
 import pandas as pd
 
 from src.blocking_v3 import hashed_matrix, multi_strategy_pairs, sparse_candidate_pairs
-from src.features_v3 import RecordTable, chunk_features, global_blocking_features, global_context_features
+from src.features_v3 import (
+    RecordTable, chunk_features, global_blocking_features, global_context_features, iter_global_context,
+)
 from src.infer import assign_matches
 from src.metrics import macro_f_beta
 from src.train import split_train_validation
@@ -66,7 +68,20 @@ def cmd_block(args):
 
 def load_candidates(path):
     z = np.load(path)
-    return z["s1_pos"].astype(np.int64), z["other_pos"].astype(np.int64), z["score"]
+    extra = z["extra_scores"] if "extra_scores" in z.files else None
+    # int32 positions: ~110M pairs x 2 arrays is 0.9GB instead of 1.8GB.
+    return z["s1_pos"].astype(np.int32), z["other_pos"].astype(np.int32), z["score"], extra
+
+
+def extra_score_features(extra, rows=None):
+    """Name-only / address-only blocking scores (0 = not retrieved by that list)."""
+    if extra is None:
+        return pd.DataFrame()
+    sel = extra if rows is None else extra[rows]
+    return pd.DataFrame({
+        "blk_name_score": sel[:, 0], "blk_addr_score": sel[:, 1],
+        "blk_n_lists": (sel > 0).sum(axis=1).astype(np.float32),
+    })
 
 
 def ground_truth_keys(dataset_dir, s1, others):
@@ -85,9 +100,12 @@ def ground_truth_keys(dataset_dir, s1, others):
 
 
 def features_for_rows(rows, s1_pos, other_pos, blk_global, s1_table, other_table, n_s2):
+    if isinstance(blk_global, GlobalRows):
+        ctx = blk_global.iloc_rows(rows)
+    else:
+        ctx = blk_global.iloc[rows].reset_index(drop=True)
     return chunk_features(
-        s1_table, other_table, s1_pos[rows], other_pos[rows], other_pos[rows] >= n_s2,
-        blk_global.iloc[rows].reset_index(drop=True),
+        s1_table, other_table, s1_pos[rows], other_pos[rows], other_pos[rows] >= n_s2, ctx,
     )
 
 
@@ -99,10 +117,10 @@ def cmd_train(args):
     import lightgbm as lgb
 
     s1, others, n_s2 = load_split(args.dataset_dir, "train")
-    s1_pos, other_pos, blk = load_candidates(args.candidates)
+    s1_pos, other_pos, blk, extra = load_candidates(args.candidates)
     log(f"candidates {len(s1_pos)}")
     true_keys, truth = ground_truth_keys(args.dataset_dir, s1, others)
-    labels = np.isin(s1_pos * len(others) + other_pos, true_keys)
+    labels = np.isin(s1_pos.astype(np.int64) * len(others) + other_pos, true_keys)
     log(f"candidate recall over all true pairs: {labels.sum() / len(true_keys):.4f}")
 
     train_ids, val_ids = split_train_validation(s1)
@@ -125,6 +143,7 @@ def cmd_train(args):
     ctx = pd.concat([
         global_blocking_features(s1_pos, other_pos, blk).iloc[keep].reset_index(drop=True),
         global_context_features(s1_table, other_table, s1_pos, other_pos, keep_rows=keep),
+        extra_score_features(extra, keep),
     ], axis=1)
     gc.collect()
     log("global context features built")
@@ -166,11 +185,64 @@ def cmd_train(args):
     log(f"saved {args.model_path}")
 
 
+def memmap_global_features(s1_table, other_table, s1_pos, other_pos, blk, extra, path):
+    """
+    Writes every global (full-candidate-set) feature column into an on-disk
+    float32 memmap of shape (n_pairs, n_columns) one column at a time, so
+    ~110M test pairs x ~20 columns (~9GB) never have to sit in RAM at once.
+    Returns (memmap, column_names).
+    """
+    def columns():
+        blk_df = global_blocking_features(s1_pos, other_pos, blk)
+        for col in blk_df.columns:
+            yield col, blk_df[col].to_numpy()
+        del blk_df
+        yield from iter_global_context(s1_table, other_table, s1_pos, other_pos)
+        extra_df = extra_score_features(extra)
+        for col in extra_df.columns:
+            yield col, extra_df[col].to_numpy()
+
+    names = list(global_blocking_features(s1_pos[:1], other_pos[:1], blk[:1]).columns)
+    names += [n for n, _ in iter_global_context_names()]
+    names += list(extra_score_features(extra[:1] if extra is not None else None).columns)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mm = np.lib.format.open_memmap(path + ".npy", mode="w+", dtype=np.float32, shape=(len(s1_pos), len(names)))
+    for col, values in columns():
+        mm[:, names.index(col)] = values
+        del values
+    mm.flush()
+    return mm, names
+
+
+def iter_global_context_names():
+    for prefix in ("gname", "gaddr"):
+        for suffix in ("other", "s1"):
+            yield f"{prefix}_rank_in_{suffix}", None
+            yield f"{prefix}_gap_in_{suffix}", None
+    yield "gname_n_near_identical_in_other", None
+    yield "gname_best", None
+
+
+class GlobalRows:
+    """Row access into the global-feature memmap through a row permutation."""
+
+    def __init__(self, mm_and_names, order):
+        self.mm, self.names = mm_and_names
+        self.order = order
+
+    def iloc_rows(self, rows):
+        idx = self.order[rows]
+        sort = np.argsort(idx)
+        block = np.empty((len(idx), len(self.names)), dtype=np.float32)
+        block[sort] = self.mm[idx[sort]]
+        return pd.DataFrame(block, columns=self.names)
+
+
 def cmd_infer(args):
     art = joblib.load(args.model_path)
     threshold = args.threshold if args.threshold is not None else art["threshold"]
     s1, others, n_s2 = load_split(args.dataset_dir, "test")
-    s1_pos, other_pos, blk = load_candidates(args.candidates)
+    s1_pos, other_pos, blk, extra = load_candidates(args.candidates)
     s1_ids = s1["entity_id"].to_numpy()
     other_ids = others["entity_id"].to_numpy()
     s1_table = RecordTable(s1, workers=args.workers)
@@ -178,17 +250,18 @@ def cmd_infer(args):
     del others
     gc.collect()
     log("record tables built")
-    blk_global = pd.concat([
-        global_blocking_features(s1_pos, other_pos, blk),
-        global_context_features(s1_table, other_table, s1_pos, other_pos),
-    ], axis=1)
+    blk_global = memmap_global_features(
+        s1_table, other_table, s1_pos, other_pos, blk, extra,
+        os.path.join(args.output_dir, "global_features.f32"),
+    )
+    del extra
     gc.collect()
     log("global context features built")
 
     # Chunk by S1 entity so every chunk holds all candidates of its entities.
     order = np.argsort(s1_pos, kind="stable")
     s1_pos, other_pos = s1_pos[order], other_pos[order]
-    blk_global = blk_global.iloc[order].reset_index(drop=True)
+    blk_global = GlobalRows(blk_global, order)
     boundaries = np.flatnonzero(np.diff(s1_pos)) + 1
     starts = np.concatenate([[0], boundaries])
     scores = np.zeros(len(s1_pos), dtype=np.float32)
