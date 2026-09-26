@@ -143,3 +143,71 @@ def is_non_latin(text) -> bool:
         if ch.isalpha():
             return ord(ch) >= 0x0370
     return False
+
+
+# --- Phonetic consonant skeletons (script-independent name matching) -------
+#
+# Indic names ("आनंद हेल्थकेयर") and their English originals ("Anand
+# Healthcare") share no characters. Reducing both to a consonant skeleton
+# ("nnd hltkr") makes them comparable: Indic letters are mapped through
+# their Unicode character names ("DEVANAGARI LETTER THA" -> "th" -> "t"),
+# Latin words by dropping vowels and folding similar-sounding consonants.
+
+_CONSONANT_FOLD = [
+    ("ph", "f"), ("bh", "b"), ("dh", "d"), ("th", "t"), ("kh", "k"), ("gh", "g"),
+    ("ch", "c"), ("jh", "j"), ("sh", "s"), ("ck", "k"), ("q", "k"), ("x", "ks"),
+    ("c", "k"), ("z", "j"), ("w", "v"), ("y", ""), ("h", ""),
+]
+_VOWELS = set("aeiou")
+_INDIC_SKELETON_CACHE = {}
+
+
+_SOFT_C_RE = re.compile(r"c(?=[eiy])")
+
+
+def _fold_consonants(latin: str) -> str:
+    latin = _SOFT_C_RE.sub("s", latin)
+    for src, dst in _CONSONANT_FOLD:
+        latin = latin.replace(src, dst)
+    out = []
+    for ch in latin:
+        if ch in _VOWELS or not ch.isalnum():
+            continue
+        if out and out[-1] == ch:
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _indic_char_latin(ch: str) -> str:
+    if ch in _INDIC_SKELETON_CACHE:
+        return _INDIC_SKELETON_CACHE[ch]
+    try:
+        name = unicodedata.name(ch)
+    except ValueError:
+        name = ""
+    latin = ""
+    if " LETTER " in name and "VOWEL" not in name:
+        # "DEVANAGARI LETTER KHA" -> "kha"; "TAMIL LETTER NNA" -> "nna"
+        parts = name.split(" LETTER ", 1)[1].split()
+        # "MALAYALAM LETTER CHILLU L" -> "l"
+        latin = (parts[-1] if parts[0] == "CHILLU" else parts[0]).lower()
+    elif "SIGN ANUSVARA" in name or "SIGN CANDRABINDU" in name:
+        latin = "n"
+    _INDIC_SKELETON_CACHE[ch] = latin
+    return latin
+
+
+def skeleton(token: str) -> str:
+    """Consonant skeleton of one token, for Latin or Indic script."""
+    if not token:
+        return ""
+    if is_non_latin(token):
+        latin = "".join(_indic_char_latin(ch) for ch in token)
+    else:
+        latin = token
+    return _fold_consonants(latin)
+
+
+def name_skeletons(core_tokens: list) -> list:
+    return [s for s in (skeleton(t) for t in core_tokens) if len(s) >= 2]

@@ -22,7 +22,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from src.blocking_v3 import hashed_matrix, sparse_candidate_pairs
+from src.blocking_v3 import hashed_matrix, multi_strategy_pairs, sparse_candidate_pairs
 from src.features_v3 import RecordTable, chunk_features, global_blocking_features, global_context_features
 from src.infer import assign_matches
 from src.metrics import macro_f_beta
@@ -49,14 +49,18 @@ def load_split(dataset_dir, split):
 def cmd_block(args):
     s1, others, _ = load_split(args.dataset_dir, args.split)
     log(f"loaded s1={len(s1)} others={len(others)}")
-    om = hashed_matrix(others, workers=args.workers)
-    sm = hashed_matrix(s1, workers=args.workers)
-    log(f"hashed others nnz={om.nnz}")
-    s1_pos, other_pos, score = sparse_candidate_pairs(
-        s1, others, top_k=args.top_k, max_df=args.max_df, workers=args.workers,
-        s1_matrix=sm, other_matrix=om, log=log,
-    )
-    np.savez(args.out, s1_pos=s1_pos, other_pos=other_pos, score=score)
+    if args.multi:
+        s1_pos, other_pos, scores = multi_strategy_pairs(s1, others, max_df=args.max_df, workers=args.workers, log=log)
+        np.savez(args.out, s1_pos=s1_pos, other_pos=other_pos, score=scores[:, 0], extra_scores=scores[:, 1:])
+    else:
+        om = hashed_matrix(others, workers=args.workers)
+        sm = hashed_matrix(s1, workers=args.workers)
+        log(f"hashed others nnz={om.nnz}")
+        s1_pos, other_pos, score = sparse_candidate_pairs(
+            s1, others, top_k=args.top_k, max_df=args.max_df, workers=args.workers,
+            s1_matrix=sm, other_matrix=om, log=log,
+        )
+        np.savez(args.out, s1_pos=s1_pos, other_pos=other_pos, score=score)
     log(f"saved {len(s1_pos)} pairs to {args.out}")
 
 
@@ -247,6 +251,7 @@ def main(argv=None):
     b.add_argument("--top-k", type=int, default=40)
     b.add_argument("--max-df", type=int, default=50_000)
     b.add_argument("--workers", type=int, default=8)
+    b.add_argument("--multi", action="store_true", help="union of combined / name-only / address-only lists")
     t = sub.add_parser("train")
     t.add_argument("--dataset-dir", required=True)
     t.add_argument("--candidates", required=True)

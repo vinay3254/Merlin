@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from src.normalize_v3 import address_tokens, name_parts
+from src.normalize_v3 import address_tokens, name_parts, name_skeletons
 
 N_FEATURES = 1 << 24
 DEFAULT_MAX_DF = 50_000
@@ -31,29 +31,38 @@ NAME_WEIGHT = 1.0
 ADDRESS_WEIGHT = 1.0
 
 
-def _record_token_ids(name, address) -> list:
-    core, _ = name_parts(name)
-    toks = {"n:" + t for t in core}
-    toks.update("a:" + t for t in address_tokens(address))
+def _record_token_ids(name, address, fields="all") -> list:
+    toks = set()
+    if fields in ("all", "name"):
+        core, _ = name_parts(name)
+        toks.update("n:" + t for t in core)
+        if fields == "name":
+            # Phonetic consonant skeletons let Indic-script names hit their
+            # English originals ("आनंद हेल्थकेयर" / "Anand Healthcare" ->
+            # "nd ltkr"). Only in the name-only matrix: added to the combined
+            # matrix they dilute it (measured recall 95.5% -> 93.0%).
+            toks.update("k:" + t for t in name_skeletons(core))
+    if fields in ("all", "addr"):
+        toks.update("a:" + t for t in address_tokens(address))
     return [zlib.crc32(t.encode("utf-8")) % N_FEATURES for t in toks]
 
 
 def _hash_chunk(args):
-    names, addresses = args
+    names, addresses, fields = args
     indptr = np.zeros(len(names) + 1, dtype=np.int64)
     indices = []
     for i, (name, address) in enumerate(zip(names, addresses)):
-        ids = _record_token_ids(name, address)
+        ids = _record_token_ids(name, address, fields)
         indices.extend(ids)
         indptr[i + 1] = indptr[i] + len(ids)
     return indptr, np.asarray(indices, dtype=np.int32)
 
 
-def hashed_matrix(df: pd.DataFrame, workers: int = 8, chunk: int = 200_000) -> sp.csr_matrix:
-    """Binary CSR matrix (rows = df rows, cols = hashed tokens)."""
+def hashed_matrix(df: pd.DataFrame, workers: int = 8, chunk: int = 200_000, fields: str = "all") -> sp.csr_matrix:
+    """Binary CSR matrix (rows = df rows, cols = hashed tokens). fields: all | name | addr."""
     names = df["business_name"].tolist()
     addresses = df["business_address"].tolist()
-    jobs = [(names[i:i + chunk], addresses[i:i + chunk]) for i in range(0, len(names), chunk)]
+    jobs = [(names[i:i + chunk], addresses[i:i + chunk], fields) for i in range(0, len(names), chunk)]
     if workers > 1 and len(jobs) > 1:
         with get_context("fork").Pool(workers) as pool:
             parts = pool.map(_hash_chunk, jobs)
@@ -186,3 +195,41 @@ def sparse_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame, **kwargs) -> 
     for s, o in zip(s1_ids[s1_pos], other_ids[other_pos]):
         result[s].add(o)
     return result
+
+
+STRATEGIES = (("all", 40), ("name", 20), ("addr", 20))
+
+
+def multi_strategy_pairs(s1_df, other_df, strategies=STRATEGIES, max_df=DEFAULT_MAX_DF, workers=8, log=None):
+    """
+    Union of per-strategy top-k lists (combined name+address, name-only with
+    phonetic skeletons, address-only). Returns (s1_pos, other_pos, scores)
+    where scores is a float32 array of shape (n_pairs, n_strategies), 0 where
+    a strategy did not retrieve the pair. Measured on a 20k-entity train
+    sample: 96.45% recall of true pairs vs 95.5% for the combined list alone.
+    """
+    keys_parts, strat_parts, score_parts = [], [], []
+    n_other = len(other_df)
+    for idx, (fields, top_k) in enumerate(strategies):
+        om = hashed_matrix(other_df, workers=workers, fields=fields)
+        sm = hashed_matrix(s1_df, workers=workers, fields=fields)
+        if log:
+            log(f"strategy {fields} top_k={top_k}: matrices built")
+        a, b, sc = sparse_candidate_pairs(
+            s1_df, other_df, top_k=top_k, max_df=max_df, workers=workers,
+            s1_matrix=sm, other_matrix=om, log=log,
+        )
+        del om, sm
+        keys_parts.append(a.astype(np.int64) * n_other + b)
+        strat_parts.append(np.full(len(a), idx, dtype=np.int8))
+        score_parts.append(sc)
+    keys = np.concatenate(keys_parts); del keys_parts
+    strat = np.concatenate(strat_parts); del strat_parts
+    score = np.concatenate(score_parts); del score_parts
+    unique_keys, inverse = np.unique(keys, return_inverse=True)
+    del keys
+    scores = np.zeros((len(unique_keys), len(strategies)), dtype=np.float32)
+    scores[inverse, strat] = score
+    s1_pos = (unique_keys // n_other).astype(np.int32)
+    other_pos = (unique_keys % n_other).astype(np.int32)
+    return s1_pos, other_pos, scores
