@@ -47,10 +47,18 @@ def score_candidates(s1_df, others_df, candidates: dict, model, feature_columns)
 
 
 def assign_matches(scored_df: pd.DataFrame, threshold: float) -> dict:
-    result = {}
-    for s1_id, group in scored_df.groupby("source1_entity_id"):
-        matched = group[group["score"] >= threshold]["other_entity_id"].tolist()
-        result[s1_id] = matched
+    """
+    Threshold, then give each S2/S3 record to at most one S1 entity (its
+    highest-scoring one). In the training ground truth no S2/S3 record is
+    matched to more than one S1 entity, so any second assignment is a
+    guaranteed false positive. Every S1 entity present in scored_df gets a
+    key, possibly with an empty list.
+    """
+    result = {s1_id: [] for s1_id in scored_df["source1_entity_id"].unique()}
+    above = scored_df[scored_df["score"] >= threshold]
+    best = above.sort_values("score", ascending=False, kind="stable").drop_duplicates("other_entity_id")
+    for s1_id, other_ids in best.groupby("source1_entity_id", sort=False, observed=True)["other_entity_id"]:
+        result[s1_id] = other_ids.tolist()
     return result
 
 

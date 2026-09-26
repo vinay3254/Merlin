@@ -42,6 +42,28 @@ def test_assign_matches_keeps_scores_above_threshold():
     assert result["S1-00001"] == ["S2-00001"]
 
 
+def test_assign_matches_gives_each_other_record_only_to_its_best_source1_entity():
+    # In the ground truth every S2/S3 record belongs to at most one S1 entity,
+    # so a record above threshold for two S1 entities must go to the higher one.
+    scored = _df([
+        {"source1_entity_id": "S1-00001", "other_entity_id": "S2-00001", "score": 0.9},
+        {"source1_entity_id": "S1-00002", "other_entity_id": "S2-00001", "score": 0.8},
+        {"source1_entity_id": "S1-00002", "other_entity_id": "S3-00001", "score": 0.7},
+    ])
+    result = assign_matches(scored, threshold=0.5)
+    assert result["S1-00001"] == ["S2-00001"]
+    assert result["S1-00002"] == ["S3-00001"]
+
+
+def test_assign_matches_keeps_entity_key_when_its_only_match_goes_elsewhere():
+    scored = _df([
+        {"source1_entity_id": "S1-00001", "other_entity_id": "S2-00001", "score": 0.9},
+        {"source1_entity_id": "S1-00002", "other_entity_id": "S2-00001", "score": 0.8},
+    ])
+    result = assign_matches(scored, threshold=0.5)
+    assert result["S1-00002"] == []
+
+
 def test_run_inference_writes_row_for_every_source1_entity_including_singletons(tmp_path):
     dataset_dir = tmp_path / "test"
     dataset_dir.mkdir()
