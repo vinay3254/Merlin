@@ -72,6 +72,18 @@ def test_train_model_fits_without_error_on_small_matrix():
     assert preds.shape == (4, 2)
 
 
+def test_train_model_fits_on_gpu_when_requested():
+    matrix = _df([
+        {"name_levenshtein": 1.0, "addr_levenshtein": 1.0, "country_match": 1, "label": 1},
+        {"name_levenshtein": 0.1, "addr_levenshtein": 0.1, "country_match": 0, "label": 0},
+        {"name_levenshtein": 0.9, "addr_levenshtein": 0.8, "country_match": 1, "label": 1},
+        {"name_levenshtein": 0.05, "addr_levenshtein": 0.0, "country_match": 0, "label": 0},
+    ])
+    model = train_model(matrix, feature_columns=["name_levenshtein", "addr_levenshtein", "country_match"], use_gpu=True)
+    preds = model.predict_proba(matrix[["name_levenshtein", "addr_levenshtein", "country_match"]])
+    assert preds.shape == (4, 2)
+
+
 import os
 import pytest
 from src.train import (

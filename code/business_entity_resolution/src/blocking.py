@@ -12,7 +12,26 @@ STOPWORDS = {
 
 MAX_TOKEN_DOC_FREQ = 500
 MAX_ADDRESS_PREFIX_DOC_FREQ = 500
-TOP_K_PER_STRATEGY = 30
+# Was bumped to 50 to chase recall, then reverted: top_k truncation is cheap
+# per-batch, but the *final* per-strategy candidate dict is held in RAM for
+# all 2.2M s1 entities at once (union_candidates merges 3 strategies' dicts
+# and that merged dict lives for the rest of run_training). 30 is what the
+# very first full-scale run (no embeddings) proved safe; the 50-cap version
+# combined with the embedding strategy's own candidates pushed a full run
+# to ~9GB+ swap and had to be killed. Recall lost here is made up by
+# embedding_knn_candidates, which finds semantically-similar pairs that
+# token/address overlap can't reach at all regardless of top_k.
+TOP_K_PER_STRATEGY = 25
+# Worst-case per-batch merge size is bounded by S1_BATCH_SIZE * max_doc_freq
+# (a single hot key can join every s1 row in the batch against every
+# other-row up to the doc-freq cap): 50_000 * 500 = 25M, proven safe at full
+# scale (2.2M s1 rows / 44 batches). Raising MAX_TOKEN_DOC_FREQ instead of
+# TOP_K_PER_STRATEGY to chase recall was tried and reverted: at full scale
+# it isn't just a memory risk -- _weighted_top_k_candidates re-filters the
+# *entire* s1 key table with .isin() once per batch, so shrinking batch
+# size to compensate multiplies total batches (and total filter-scan work)
+# by the same factor, adding hours of runtime. Recall is better won via
+# embedding_knn_candidates (semantic, not token-overlap-bound) instead.
 S1_BATCH_SIZE = 50_000
 
 
@@ -124,6 +143,16 @@ def address_prefix_candidates(
 FLAT_INDEX_THRESHOLD = 1000  # below this many rows, exact search is cheap enough
 
 
+EMBED_BATCH_SIZE = 256
+# Above this many rows, an IVFFlat index (stores full float32 vectors, ~1.5KB/
+# vector at dim=384) would need multiple GB of RAM for a single country
+# partition (this dataset's largest partition is ~6.2M rows). Switch to
+# IVFPQ, which stores compressed codes (PQ_M bytes/vector) instead.
+PQ_INDEX_THRESHOLD = 1_000_000
+PQ_M = 48  # dim=384 must be divisible by PQ_M; 384/48=8-dim subvectors
+PQ_NBITS = 8
+
+
 def default_embedder(texts: list) -> np.ndarray:
     from sentence_transformers import SentenceTransformer
 
@@ -131,7 +160,9 @@ def default_embedder(texts: list) -> np.ndarray:
     if model is None:
         model = SentenceTransformer("all-MiniLM-L6-v2")
         default_embedder._model = model
-    vectors = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    vectors = model.encode(
+        texts, batch_size=EMBED_BATCH_SIZE, normalize_embeddings=True, show_progress_bar=False,
+    )
     return np.array(vectors)
 
 
@@ -141,41 +172,72 @@ def _combined_texts(df) -> list:
     return [f"{n} {a}".strip() for n, a in zip(names, addrs)]
 
 
-def _search_partition(s1_df, other_df, embedder, top_k: int, min_sim: float) -> dict:
+def _encode_chunks(texts: list, embedder, chunk_size: int):
+    # Encodes chunk_size texts at a time so peak memory for the vector array
+    # is bounded by chunk_size regardless of len(texts) -- never materializes
+    # an (N, dim) float32 array for a multi-million-row partition at once.
+    for start in range(0, len(texts), chunk_size):
+        chunk = texts[start:start + chunk_size]
+        yield np.ascontiguousarray(embedder(chunk), dtype="float32")
+
+
+def _build_other_index(other_texts: list, embedder, chunk_size: int):
     import faiss
 
-    s1_ids = s1_df["entity_id"].tolist()
-    other_ids = other_df["entity_id"].tolist()
+    n_other = len(other_texts)
+    probe = np.ascontiguousarray(embedder(other_texts[:1]), dtype="float32")
+    dim = probe.shape[1]
 
-    s1_vecs = np.ascontiguousarray(embedder(_combined_texts(s1_df)), dtype="float32")
-    other_vecs = np.ascontiguousarray(embedder(_combined_texts(other_df)), dtype="float32")
-    dim = other_vecs.shape[1]
-
-    if len(other_ids) < FLAT_INDEX_THRESHOLD:
+    if n_other < FLAT_INDEX_THRESHOLD:
         index = faiss.IndexFlatIP(dim)
-    else:
-        nlist = max(1, min(int(len(other_ids) ** 0.5), 4096))
+    elif n_other < PQ_INDEX_THRESHOLD:
+        nlist = max(1, min(int(n_other ** 0.5), 4096))
         quantizer = faiss.IndexFlatIP(dim)
         index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
-        index.train(other_vecs)
+        train_vecs = np.ascontiguousarray(embedder(other_texts[:min(n_other, max(nlist * 40, 100_000))]), dtype="float32")
+        index.train(train_vecs)
         index.nprobe = min(nlist, 10)
-    index.add(other_vecs)
+        del train_vecs
+    else:
+        nlist = max(1, min(int(n_other ** 0.5), 4096))
+        quantizer = faiss.IndexFlatIP(dim)
+        index = faiss.IndexIVFPQ(quantizer, dim, nlist, PQ_M, PQ_NBITS, faiss.METRIC_INNER_PRODUCT)
+        rng = np.random.RandomState(0)
+        sample_size = min(n_other, max(nlist * 40, 200_000))
+        sample_idx = sorted(rng.choice(n_other, size=sample_size, replace=False)) if sample_size < n_other else range(n_other)
+        train_vecs = np.ascontiguousarray(embedder([other_texts[i] for i in sample_idx]), dtype="float32")
+        index.train(train_vecs)
+        index.nprobe = min(nlist, 10)
+        del train_vecs
 
+    for vecs in _encode_chunks(other_texts, embedder, chunk_size):
+        index.add(vecs)
+    return index
+
+
+def _search_partition(s1_df, other_df, embedder, top_k: int, min_sim: float, chunk_size: int = EMBED_BATCH_SIZE * 100) -> dict:
+    s1_ids = s1_df["entity_id"].tolist()
+    other_ids = other_df["entity_id"].tolist()
+    other_texts = _combined_texts(other_df)
+    s1_texts = _combined_texts(s1_df)
+
+    index = _build_other_index(other_texts, embedder, chunk_size)
     k = min(top_k, len(other_ids))
-    sims, indices = index.search(s1_vecs, k)
 
     result = {}
-    for i, s1_id in enumerate(s1_ids):
-        candidates = {
-            other_ids[idx]
-            for idx, sim in zip(indices[i], sims[i])
-            if idx != -1 and sim >= min_sim
-        }
-        result[s1_id] = candidates
+    for start, vecs in zip(range(0, len(s1_texts), chunk_size), _encode_chunks(s1_texts, embedder, chunk_size)):
+        sims, indices = index.search(vecs, k)
+        for i, sim_row, idx_row in zip(range(start, start + len(vecs)), sims, indices):
+            candidates = {
+                other_ids[idx]
+                for idx, sim in zip(idx_row, sim_row)
+                if idx != -1 and sim >= min_sim
+            }
+            result[s1_ids[i]] = candidates
     return result
 
 
-def embedding_knn_candidates(s1_df, other_df, embedder=default_embedder, top_k: int = 10, min_sim: float = 0.5) -> dict:
+def embedding_knn_candidates(s1_df, other_df, embedder=default_embedder, top_k: int = 8, min_sim: float = 0.5) -> dict:
     result = {eid: set() for eid in s1_df["entity_id"]}
     if len(s1_df) == 0 or len(other_df) == 0:
         return result

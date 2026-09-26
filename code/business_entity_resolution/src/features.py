@@ -127,7 +127,13 @@ def featurize_pairs(pairs_df, s1_df, others_df, embed_lookup=None, chunk_size=1_
         chunk = pairs_df.iloc[start:start + chunk_size]
         merged = chunk.merge(s1_renamed, on="source1_entity_id").merge(others_renamed, on="other_entity_id")
 
-        feature_rows = []
+        # Per-feature-column lists instead of a list of per-row dicts: a dict
+        # costs several hundred bytes of Python object overhead per row, and
+        # at this dataset's scale (tens of millions of pairs) that overhead
+        # alone can reach multiple GB *per chunk*, retained until the final
+        # concat. Plain per-column float/int lists are an order of magnitude
+        # cheaper and are what pd.DataFrame needs anyway.
+        feature_columns = None
         for row in merged.itertuples():
             embed_a = embed_lookup.get(row.source1_entity_id) if embed_lookup else None
             embed_b = embed_lookup.get(row.other_entity_id) if embed_lookup else None
@@ -136,9 +142,12 @@ def featurize_pairs(pairs_df, s1_df, others_df, embed_lookup=None, chunk_size=1_
                 row.name_b, row.addr_b, row.country_b,
                 embed_a=embed_a, embed_b=embed_b,
             )
-            feature_rows.append(feats)
+            if feature_columns is None:
+                feature_columns = {key: [] for key in feats}
+            for key, value in feats.items():
+                feature_columns[key].append(value)
 
-        feat_df = pd.DataFrame(feature_rows)
+        feat_df = pd.DataFrame(feature_columns or {})
         for col in pairs_df.columns:
             feat_df[col] = merged[col].values
         chunk_frames.append(feat_df)
