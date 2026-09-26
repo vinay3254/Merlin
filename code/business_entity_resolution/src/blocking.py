@@ -12,15 +12,21 @@ STOPWORDS = {
 
 MAX_TOKEN_DOC_FREQ = 500
 MAX_ADDRESS_PREFIX_DOC_FREQ = 500
-# Was bumped to 50 to chase recall, then reverted: top_k truncation is cheap
-# per-batch, but the *final* per-strategy candidate dict is held in RAM for
-# all 2.2M s1 entities at once (union_candidates merges 3 strategies' dicts
-# and that merged dict lives for the rest of run_training). 30 is what the
-# very first full-scale run (no embeddings) proved safe; the 50-cap version
-# combined with the embedding strategy's own candidates pushed a full run
-# to ~9GB+ swap and had to be killed. Recall lost here is made up by
-# embedding_knn_candidates, which finds semantically-similar pairs that
-# token/address overlap can't reach at all regardless of top_k.
+# History: bumped to 50 (+ embedding top_k 20) once, reasoning that
+# HANDOFF.md's synthetic benchmark measured that combo's candidate dict at
+# ~12.76GB for all 2.2M entities -- safely inside 15GB RAM + 31GB swap. That
+# benchmark's ~55-avg-candidates/entity figure was measured against the OLD
+# address_prefix_candidates strategy (one key per entity, low row count).
+# address_token_overlap_candidates (see below) explodes each address into
+# many tokens and independently measured ~89.6% standalone recall -- i.e. it
+# contributes far more unique candidates per entity than address_prefix ever
+# did, so the old 55-avg estimate doesn't transfer once top_k=50 is combined
+# with *this* strategy. Confirmed by a real full-scale run: swap climbed to
+# 18-20GB with sustained 30-270MB/s si/so and a context-switch storm
+# (up to 1.57M/2s, vs. a normal ~10-20k) -- genuine thrashing, killed after
+# ~2hrs. Reverted to 25 (and embedding top_k back to 8) to isolate the
+# address_token_overlap_candidates fix itself, which is the real recall win,
+# without compounding it with a second simultaneous change.
 TOP_K_PER_STRATEGY = 25
 # Worst-case per-batch merge size is bounded by S1_BATCH_SIZE * max_doc_freq
 # (a single hot key can join every s1 row in the batch against every
@@ -146,12 +152,35 @@ def _address_token_table(df, id_col_name: str) -> pd.DataFrame:
     return table.explode("token").dropna(subset=["token"])
 
 
+# Deliberately its own, tighter cap -- NOT reusing MAX_ADDRESS_PREFIX_DOC_FREQ
+# or MAX_TOKEN_DOC_FREQ. Addresses explode into far more (entity, token)
+# rows per record than business names (~6-10 address tokens vs ~2-3 name
+# tokens after stopword filtering), so the *same* doc_freq cap and batch
+# size that are safe for token_overlap_candidates are NOT safe here: the
+# per-batch merge (batch_keys.merge(capped_other, on="key")) scales with
+# total (s1_row, key) pairs in the batch, which is batch_size *
+# avg_tokens_per_entity, not just batch_size. Confirmed by two real
+# full-scale crashes at max_doc_freq=500 (once at top_k=50, once at the
+# "safe" top_k=25/embedding-top_k=8 config that token_overlap_candidates
+# itself was proven safe at) -- both showed genuine thrashing (sustained
+# 15-270MB/s so, iowait up to 66%, swap approaching the full 31GB). Cutting
+# this cap to 150 (moderately-common address tokens like street/area names
+# excluded, only names/street numbers/PIN-code-level specificity survive)
+# is the first real fix to try, verified on a fast blocking-only (no
+# embeddings) full-scale run before ever re-committing to a multi-hour
+# embeddings run.
+MAX_ADDRESS_TOKEN_DOC_FREQ = 150
+# Halved from S1_BATCH_SIZE for the same reason -- an address-token-specific
+# defensive margin on top of the lower doc_freq cap, not a substitute for it.
+ADDRESS_TOKEN_BATCH_SIZE = 25_000
+
+
 def address_token_overlap_candidates(
     s1_df,
     other_df,
-    max_doc_freq: int = MAX_ADDRESS_PREFIX_DOC_FREQ,
+    max_doc_freq: int = MAX_ADDRESS_TOKEN_DOC_FREQ,
     top_k: int = TOP_K_PER_STRATEGY,
-    batch_size: int = S1_BATCH_SIZE,
+    batch_size: int = ADDRESS_TOKEN_BATCH_SIZE,
 ) -> dict:
     """
     Full-address-token overlap (same weighted-top-k machinery as
@@ -164,10 +193,10 @@ def address_token_overlap_candidates(
     pairs. A diagnostic on a 1500-entity India sample with known non-Latin-
     script matches measured address-prefix-only recall at 37.2% vs this
     strategy's 89.6% (name-token + address-prefix union: 68.5%; name-token +
-    this strategy union: 95.6%). Same complexity/memory bounds as
-    token_overlap_candidates (same _weighted_top_k_candidates, same
-    max_doc_freq/batch_size defaults), so it's safe at the scale that
-    strategy was already proven at.
+    this strategy union: 95.6%). NOTE: unlike token_overlap_candidates, this
+    strategy needs its own (tighter) doc_freq cap and batch size -- see
+    MAX_ADDRESS_TOKEN_DOC_FREQ above for why the name-token bounds don't
+    transfer.
     """
     s1_tokens = _address_token_table(s1_df, "entity_id_s1").rename(columns={"token": "key"})
     other_tokens = _address_token_table(other_df, "entity_id_other").rename(columns={"token": "key"})
@@ -180,7 +209,12 @@ def address_token_overlap_candidates(
 FLAT_INDEX_THRESHOLD = 1000  # below this many rows, exact search is cheap enough
 
 
-EMBED_BATCH_SIZE = 256
+# VRAM-bound knob for the GPU forward-pass batch size (chunk_size below is a
+# separate, host-side bookkeeping batch, unaffected). MiniLM is tiny (384-dim,
+# short business-name+address text), so this is generous headroom, not a
+# reckless bump -- checked live against a running encode job: 787MiB/6141MiB
+# VRAM in use at batch_size=256, i.e. ~5.3GB free on this RTX 4050.
+EMBED_BATCH_SIZE = 2048
 # Above this many rows, an IVFFlat index (stores full float32 vectors, ~1.5KB/
 # vector at dim=384) would need multiple GB of RAM for a single country
 # partition (this dataset's largest partition is ~6.2M rows). Switch to

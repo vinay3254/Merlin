@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from src.blocking_v3 import hashed_matrix, sparse_candidate_pairs
-from src.features_v3 import RecordTable, chunk_features, global_blocking_features
+from src.features_v3 import RecordTable, chunk_features, global_blocking_features, global_context_features
 from src.infer import assign_matches
 from src.metrics import macro_f_beta
 from src.train import split_train_validation
@@ -100,7 +100,6 @@ def cmd_train(args):
     true_keys, truth = ground_truth_keys(args.dataset_dir, s1, others)
     labels = np.isin(s1_pos * len(others) + other_pos, true_keys)
     log(f"candidate recall over all true pairs: {labels.sum() / len(true_keys):.4f}")
-    blk_global = global_blocking_features(s1_pos, other_pos, blk)
 
     train_ids, val_ids = split_train_validation(s1)
     rng = random.Random(args.seed)
@@ -118,10 +117,21 @@ def cmd_train(args):
 
     tr_rows = rows_for_entities(s1_pos, train_ents)
     va_rows = rows_for_entities(s1_pos, val_ents)
-    x_tr = features_for_rows(tr_rows, s1_pos, other_pos, blk_global, s1_table, other_table, n_s2)
+    keep = np.concatenate([tr_rows, va_rows])
+    ctx = pd.concat([
+        global_blocking_features(s1_pos, other_pos, blk).iloc[keep].reset_index(drop=True),
+        global_context_features(s1_table, other_table, s1_pos, other_pos, keep_rows=keep),
+    ], axis=1)
+    gc.collect()
+    log("global context features built")
+    n_tr = len(tr_rows)
+    x_tr = chunk_features(s1_table, other_table, s1_pos[tr_rows], other_pos[tr_rows],
+                          other_pos[tr_rows] >= n_s2, ctx.iloc[:n_tr].reset_index(drop=True))
     y_tr = labels[tr_rows]
-    x_va = features_for_rows(va_rows, s1_pos, other_pos, blk_global, s1_table, other_table, n_s2)
+    x_va = chunk_features(s1_table, other_table, s1_pos[va_rows], other_pos[va_rows],
+                          other_pos[va_rows] >= n_s2, ctx.iloc[n_tr:].reset_index(drop=True))
     y_va = labels[va_rows]
+    del ctx
     feature_columns = list(x_tr.columns)
     log(f"train pairs {len(x_tr)} (pos {y_tr.sum()}), val pairs {len(x_va)} (pos {y_va.sum()})")
 
@@ -129,7 +139,8 @@ def cmd_train(args):
         n_estimators=args.rounds, learning_rate=0.05, num_leaves=255, min_child_samples=50,
         subsample=0.8, subsample_freq=1, colsample_bytree=0.8, n_jobs=args.workers, verbose=-1,
     )
-    model.fit(x_tr, y_tr, eval_set=[(x_va, y_va)], callbacks=[lgb.log_evaluation(100)])
+    model.fit(x_tr, y_tr, eval_set=[(x_va, y_va)],
+              callbacks=[lgb.log_evaluation(50), lgb.early_stopping(50)])
     log("model trained")
 
     scored = pd.DataFrame({
@@ -156,7 +167,6 @@ def cmd_infer(args):
     threshold = args.threshold if args.threshold is not None else art["threshold"]
     s1, others, n_s2 = load_split(args.dataset_dir, "test")
     s1_pos, other_pos, blk = load_candidates(args.candidates)
-    blk_global = global_blocking_features(s1_pos, other_pos, blk)
     s1_ids = s1["entity_id"].to_numpy()
     other_ids = others["entity_id"].to_numpy()
     s1_table = RecordTable(s1, workers=args.workers)
@@ -164,6 +174,12 @@ def cmd_infer(args):
     del others
     gc.collect()
     log("record tables built")
+    blk_global = pd.concat([
+        global_blocking_features(s1_pos, other_pos, blk),
+        global_context_features(s1_table, other_table, s1_pos, other_pos),
+    ], axis=1)
+    gc.collect()
+    log("global context features built")
 
     # Chunk by S1 entity so every chunk holds all candidates of its entities.
     order = np.argsort(s1_pos, kind="stable")
@@ -237,7 +253,7 @@ def main(argv=None):
     t.add_argument("--model-path", required=True)
     t.add_argument("--train-entities", type=int, default=400_000)
     t.add_argument("--val-entities", type=int, default=60_000)
-    t.add_argument("--rounds", type=int, default=600)
+    t.add_argument("--rounds", type=int, default=1500)
     t.add_argument("--seed", type=int, default=7)
     t.add_argument("--workers", type=int, default=10)
     i = sub.add_parser("infer")

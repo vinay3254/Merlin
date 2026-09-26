@@ -150,3 +150,47 @@ def chunk_features(s1: RecordTable, other: RecordTable, s1_pos, other_pos, other
     feat["na_rank_in_s1"] = rank
     feat["na_gap_in_s1"] = gap
     return feat
+
+
+def global_context_features(s1: RecordTable, other: RecordTable, s1_pos, other_pos, keep_rows=None, chunk: int = 10_000_000) -> pd.DataFrame:
+    """
+    Name/address context over the FULL candidate set. For each pair: how its
+    name (and address) similarity ranks among the other record's competing
+    S1 entities and among the S1 entity's candidates, the gap to the best,
+    and how many competing S1 entities have a near-identical name. This is
+    what separates "identical name, empty address, and no other S1 entity
+    carries that name" (a match) from "identical name shared by several S1
+    entities" (ambiguous) -- model_v3 without it scored the former ~0.03.
+
+    keep_rows: if given, only these rows of the result are materialized
+    (the group statistics still see every pair).
+    """
+    n = len(s1_pos)
+    name_ts = np.empty(n, dtype=np.float32)
+    name_ns = np.empty(n, dtype=np.float32)
+    addr_ts = np.empty(n, dtype=np.float32)
+    for start in range(0, n, chunk):
+        sl = slice(start, start + chunk)
+        a, b = s1_pos[sl], other_pos[sl]
+        name_ts[sl] = _cp(s1.core[a], other.core[b], fuzz.token_set_ratio)
+        name_ns[sl] = _cp(s1.nospace[a], other.nospace[b], fuzz.ratio)
+        addr_ts[sl] = _cp(s1.addr[a], other.addr[b], fuzz.token_set_ratio)
+    name_best = np.maximum(name_ts, name_ns)
+    del name_ts, name_ns
+    rows = slice(None) if keep_rows is None else keep_rows
+    out = {}
+    for values, prefix in ((name_best, "gname"), (addr_ts, "gaddr")):
+        rank_o, gap_o, _ = _rank_gap(other_pos, values)
+        out[f"{prefix}_rank_in_other"] = rank_o[rows]
+        out[f"{prefix}_gap_in_other"] = gap_o[rows]
+        del rank_o, gap_o
+        rank_s, gap_s, _ = _rank_gap(s1_pos, values)
+        out[f"{prefix}_rank_in_s1"] = rank_s[rows]
+        out[f"{prefix}_gap_in_s1"] = gap_s[rows]
+        del rank_s, gap_s
+    near_identical = (name_best >= 90).astype(np.float32)
+    out["gname_n_near_identical_in_other"] = (
+        pd.Series(near_identical).groupby(other_pos).transform("sum").to_numpy(np.float32)[rows]
+    )
+    out["gname_best"] = name_best[rows]
+    return pd.DataFrame(out)

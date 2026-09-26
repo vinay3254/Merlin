@@ -66,3 +66,23 @@ def test_chunk_features_match_across_formatting_noise():
     assert feat.loc[1, "house_match"] == 0
     assert feat.loc[0, "na_rank_in_s1"] == 1
     assert feat.loc[1, "blk_rank_in_s1"] == 2
+
+
+def test_global_context_counts_competing_s1_entities_with_identical_name():
+    from src.features_v3 import global_context_features
+
+    a = RecordTable(_df([
+        ["S1-1", "Rev It Up Cleaning Service", "1401 Acapulco Court, Grand Prairie, TX", "US"],
+        ["S1-2", "Rev It Up Cleaning Service", "312 Bates Hollow Road, Broome, NY", "US"],
+        ["S1-3", "Patriot Initiative Corp", "605 Van Dyck Drive, Temple, TX", "US"],
+    ]), workers=1)
+    b = RecordTable(_df([
+        ["S2-1", "Rev It Up Cleaning Service Ltd", "", "US"],
+        ["S2-2", "Patriot Initiative (Corp)", "", "US"],
+    ]), workers=1)
+    s1_pos, other_pos = np.array([0, 1, 2, 2]), np.array([0, 0, 1, 0])
+    ctx = global_context_features(a, b, s1_pos, other_pos)
+    assert list(ctx["gname_n_near_identical_in_other"]) == [2, 2, 1, 2]
+    assert ctx.loc[2, "gname_rank_in_other"] == 1
+    assert ctx.loc[2, "gname_gap_in_other"] == 0
+    assert ctx.loc[3, "gname_rank_in_other"] == 3
