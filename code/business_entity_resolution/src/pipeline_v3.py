@@ -191,17 +191,34 @@ def cmd_infer(args):
     })
     os.makedirs(args.output_dir, exist_ok=True)
     scored.to_csv(os.path.join(args.output_dir, "scores.tsv.gz"), sep="\t", index=False, float_format="%.5f")
-    candidates = scored.groupby("source1_entity_id", observed=True)["other_entity_id"].agg(list).to_dict()
-    for eid in s1_ids:
-        candidates.setdefault(eid, [])
-    write_id_mapping_tsv(candidates, os.path.join(args.output_dir, "candidate_pairs.tsv"),
+    write_outputs(scored, s1_ids, threshold, args.output_dir)
+
+
+def write_outputs(scored, s1_ids, threshold, output_dir):
+    """candidate_pairs.tsv (every scored pair) + matching_results.tsv (assigned)."""
+    candidates = {eid: [] for eid in s1_ids}
+    for s1_id, other_id in zip(scored["source1_entity_id"].astype(str), scored["other_entity_id"].astype(str)):
+        candidates[s1_id].append(other_id)
+    write_id_mapping_tsv(candidates, os.path.join(output_dir, "candidate_pairs.tsv"),
                          id_col="source1_entity_id", list_col="candidate_entity_ids")
+    del candidates
     matches = assign_matches(scored, threshold)
+    matches = {str(k): [str(v) for v in vs] for k, vs in matches.items()}
     for eid in s1_ids:
         matches.setdefault(eid, [])
-    write_id_mapping_tsv(matches, os.path.join(args.output_dir, "matching_results.tsv"),
+    write_id_mapping_tsv(matches, os.path.join(output_dir, "matching_results.tsv"),
                          id_col="source1_entity_id", list_col="matched_entity_ids")
-    log(f"wrote outputs to {args.output_dir} at threshold {threshold}")
+    log(f"wrote outputs to {output_dir} at threshold {threshold}")
+
+
+def cmd_finalize(args):
+    """Rebuild outputs from a saved scores.tsv.gz (e.g. at another threshold)."""
+    scored = pd.read_csv(
+        os.path.join(args.output_dir, "scores.tsv.gz"), sep="\t", keep_default_na=False,
+        dtype={"source1_entity_id": "category", "other_entity_id": "category", "score": "float32"},
+    )
+    s1_ids = read_source_tsv(os.path.join(args.dataset_dir, "test_source1.tsv"))["entity_id"].to_numpy()
+    write_outputs(scored, s1_ids, args.threshold, args.output_dir)
 
 
 def main(argv=None):
@@ -231,8 +248,12 @@ def main(argv=None):
     i.add_argument("--threshold", type=float, default=None)
     i.add_argument("--chunk-pairs", type=int, default=4_000_000)
     i.add_argument("--workers", type=int, default=10)
+    f = sub.add_parser("finalize")
+    f.add_argument("--dataset-dir", required=True)
+    f.add_argument("--output-dir", required=True)
+    f.add_argument("--threshold", type=float, required=True)
     args = parser.parse_args(argv)
-    {"block": cmd_block, "train": cmd_train, "infer": cmd_infer}[args.cmd](args)
+    {"block": cmd_block, "train": cmd_train, "infer": cmd_infer, "finalize": cmd_finalize}[args.cmd](args)
 
 
 if __name__ == "__main__":
