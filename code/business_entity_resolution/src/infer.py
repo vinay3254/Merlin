@@ -6,7 +6,7 @@ import pandas as pd
 
 from src.blocking import (
     token_overlap_candidates,
-    address_prefix_candidates,
+    address_token_overlap_candidates,
     embedding_knn_candidates,
     union_candidates,
     candidates_to_rows,
@@ -22,7 +22,7 @@ def generate_candidates(s1_df, s2_df, s3_df, embedder=None, others_df=None) -> d
         others_df = pd.concat([s2_df, s3_df], ignore_index=True)
     strategies = [
         token_overlap_candidates(s1_df, others_df),
-        address_prefix_candidates(s1_df, others_df),
+        address_token_overlap_candidates(s1_df, others_df),
     ]
     if embedder is not None:
         strategies.append(embedding_knn_candidates(s1_df, others_df, embedder=embedder))

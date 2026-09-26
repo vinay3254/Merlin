@@ -43,3 +43,7 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+
+# Logs and training run artifacts
+*.log
+catboost_info/

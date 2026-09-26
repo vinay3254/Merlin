@@ -16,7 +16,10 @@ Challenge window: 25 Sep 2026 00:00 IST – 27 Sep 2026 23:59 IST. Max 5
 leaderboard submissions/day. Top-100 teams must later submit methodology +
 source code + candidate-generation/blocking strategy details.
 
-## Status (as of 2026-09-25)
+## Status (as of 2026-09-26)
+
+See `HANDOFF.md` for a full narrative of this session (what broke, why, and
+how it was fixed) — this section is just the current-state summary.
 
 - Design spec and implementation plan are written and committed — see "Where
   to look" below. Both were revised once already after the real dataset's
@@ -24,18 +27,42 @@ source code + candidate-generation/blocking strategy details.
   dense-matrix/iterrows-based design.
 - Real dataset downloaded and extracted to `student_resource/dataset/`
   (2.2M–5.3M rows per source file, ~2.5GB total, gitignored).
-- **No pipeline code written yet** — `code/business_entity_resolution/`
-  does not exist. Execution (subagent-driven-development against the plan)
-  has not started.
-- **Training has not been run.** No model artifact exists.
-- What's left: implement all 11 plan tasks (I/O utils, normalize, blocking,
-  features, metrics, train, infer), run the pipeline against the real
-  dataset, tune the classification threshold, fill in
-  `student_resource/Documentation_template.md`, assemble the final
-  submission zip.
+- **Pipeline code is implemented** at `code/business_entity_resolution/`
+  (all 11 plan tasks). 79 tests pass (`pytest tests/ -v`).
+- **Training has been run twice, end-to-end, on the real full-scale
+  dataset:**
+  - `model.joblib` — first successful run, token+address blocking only (no
+    embeddings). Validation F_0.5 = **0.6302**, threshold 0.75. Kept as a
+    known-good fallback artifact; do not overwrite.
+  - `model_v2.joblib` — second run, with `--use-embeddings` (semantic
+    blocking added on top of token+address). Validation F_0.5 = **0.8341**,
+    threshold 0.70, 33,212,774 training pairs, 441,364 validation entities.
+    This is the current best model.
+- **Inference has been run on the real test set** with `model_v2.joblib`:
+  `output/matching_results.tsv` and `output/candidate_pairs.tsv` exist and
+  passed `validate_submission.py` (PASS, no blocking issues). Not yet
+  confirmed submitted to the leaderboard — check with whoever picks this up
+  before assuming it was.
+- **Machine is memory-constrained (15GB RAM, RTX 4050 laptop GPU, 6GB
+  VRAM).** Getting `model_v2.joblib` trained took 4 failed/killed attempts
+  before succeeding — see `HANDOFF.md` and the comments in `src/blocking.py`
+  / `src/train.py` / `src/features.py` for the specific fixes. Do not change
+  `TOP_K_PER_STRATEGY`, `MAX_TOKEN_DOC_FREQ`, `MAX_ADDRESS_PREFIX_DOC_FREQ`,
+  or the embedding `top_k` defaults without re-reading those comments first
+  — several of these look like easy wins for recall but caused real OOM/swap
+  crises at full (2.2M-entity) scale.
+- What's left: decide whether to iterate further (blocking recall is still
+  ~79.5% on a sample diagnostic, so there's real headroom above 0.8341),
+  fill in `student_resource/Documentation_template.md`, assemble the final
+  submission zip, confirm leaderboard submission.
 
 ## Where to look
 
+- `HANDOFF.md` — narrative account of the 2026-09-26 session: how the
+  pipeline went from "no code" to a validated 0.8341 model, every dead end
+  hit along the way (candidate blowup, OOM kills, thrashing), and what a
+  fresh pair of eyes needs to know before touching `src/blocking.py` or
+  `src/train.py` again.
 - `docs/superpowers/specs/2026-09-25-business-entity-resolution-design.md` —
   design spec, authoritative for **why** (constraints, scale numbers,
   architecture rationale).
@@ -85,25 +112,45 @@ index — never a dense similarity matrix across full sources, and never a
 the plan's Step 3 code for every blocking/feature/scoring task, not by unit
 tests (which use small fixtures and would pass either way).
 
-## Commands (once code exists — see plan Task 1/11 for exact versions)
+## Commands
+
+The venv at `.venv/` (repo root) already has all deps installed, including
+`torch`+CUDA, `sentence-transformers`, and `faiss-cpu`. Use
+`.venv/bin/python`, not a bare `python3`.
 
 ```bash
-pip install -r code/business_entity_resolution/requirements.txt
-
-# Run the full test suite
-cd code/business_entity_resolution && python -m pytest tests/ -v
+# Run the full test suite (fast, ~3s, uses tiny fixtures)
+cd code/business_entity_resolution && /home/vinay/amzon-ml/.venv/bin/python -m pytest tests/ -v
 
 # Run a single test
-python -m pytest tests/test_blocking.py::test_token_overlap_candidates_matches_shared_significant_token -v
+.venv/bin/python -m pytest tests/test_blocking.py::test_token_overlap_candidates_matches_shared_significant_token -v
 
-# Train (writes model.joblib)
-python -m src.train_cli --dataset-dir student_resource/dataset/train --model-path model.joblib
+# Train on the real full dataset. Takes ~2 hours with --use-embeddings
+# (dominated by GPU-encoding the ~10.3M "other" rows once), ~50 min without.
+# Run in the background (nohup ... &) and monitor `free -h` / the log file --
+# see HANDOFF.md before doing this, the naive version OOMs.
+.venv/bin/python -m src.train_cli \
+    --dataset-dir student_resource/dataset/train \
+    --model-path model_v2.joblib \
+    --use-embeddings
 
-# Infer (writes output/matching_results.tsv and output/candidate_pairs.tsv)
-python -m src.infer_cli --dataset-dir student_resource/dataset/test --model-path model.joblib --output-dir output
+# To iterate on classifier/feature/negative-sampling changes without paying
+# the ~2hr blocking cost every time, add --candidates-cache <path>: first
+# run populates it, later runs against the same path reuse it (untested as
+# of 2026-09-26 -- see HANDOFF.md item 5 before relying on it).
+#   --candidates-cache candidates_v1.pkl --max-negatives-per-positive 10
+
+# Infer (writes output/matching_results.tsv and output/candidate_pairs.tsv).
+# Also ~2 hours with --use-embeddings; pass it to match how the model was
+# trained, or blocking recall at inference time won't match validation.
+.venv/bin/python -m src.infer_cli \
+    --dataset-dir student_resource/dataset/test \
+    --model-path model_v2.joblib \
+    --output-dir output \
+    --use-embeddings
 
 # Validate output format before submitting
-python3 student_resource/utils/validate_submission.py \
+.venv/bin/python student_resource/utils/validate_submission.py \
     --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv \
     --test-dir student_resource/dataset/test

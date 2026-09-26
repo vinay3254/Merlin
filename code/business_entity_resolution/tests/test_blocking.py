@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from src.blocking import build_token_index, token_overlap_candidates, address_prefix_candidates, embedding_knn_candidates, union_candidates, candidates_to_rows
+from src.blocking import build_token_index, token_overlap_candidates, address_prefix_candidates, address_token_overlap_candidates, embedding_knn_candidates, union_candidates, candidates_to_rows
 
 
 def _df(rows):
@@ -150,6 +150,54 @@ def test_address_prefix_candidates_batching_matches_unbatched_result():
     assert batched == unbatched
     assert batched["S1-00001"] == {"S2-00001"}
     assert batched["S1-00002"] == {"S2-00002"}
+
+
+def test_address_token_overlap_candidates_matches_reordered_abbreviated_address():
+    # Real-world pattern: S2/S3 addresses reorder tokens (house number to
+    # front) and drop street-level detail -- a prefix match (first N tokens)
+    # can't survive this, but full-token overlap still shares "1502" and
+    # "faridabad".
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "", "business_address": "1502 Tower Olive Omaxe Badhkal Road Sector 43 Faridabad Haryana", "country": "India"}])
+    other = _df([{"entity_id": "S2-00001", "business_name": "", "business_address": "B3 1502 Faridabad HR", "country": "India"}])
+    result = address_token_overlap_candidates(s1, other)
+    assert result["S1-00001"] == {"S2-00001"}
+
+
+def test_address_token_overlap_candidates_handles_missing_address_without_raising():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "Acme", "business_address": "", "country": "US"}])
+    s2 = _df([{"entity_id": "S2-00001", "business_name": "Acme", "business_address": "", "country": "US"}])
+    result = address_token_overlap_candidates(s1, s2)
+    assert result["S1-00001"] == set()
+
+
+def test_address_token_overlap_candidates_excludes_tokens_over_max_doc_freq():
+    s1 = _df([{"entity_id": "S1-00001", "business_name": "", "business_address": "42 elm street springfield", "country": "US"}])
+    # "elm" is over-cap (freq=3 > 2); "springfield" is not shared at all here,
+    # "42" doc_freq=1 under-cap -- should still match via "42"
+    other = _df([
+        {"entity_id": "S2-00001", "business_name": "", "business_address": "42 elm", "country": "US"},
+        {"entity_id": "S2-00002", "business_name": "", "business_address": "elm ave", "country": "US"},
+        {"entity_id": "S2-00003", "business_name": "", "business_address": "elm court", "country": "US"},
+    ])
+    result = address_token_overlap_candidates(s1, other, max_doc_freq=2)
+    assert result["S1-00001"] == {"S2-00001"}
+
+
+def test_address_token_overlap_candidates_batching_matches_unbatched_result():
+    s1 = _df([
+        {"entity_id": "S1-00001", "business_name": "", "business_address": "123 MG Road Bangalore", "country": "India"},
+        {"entity_id": "S1-00002", "business_name": "", "business_address": "77 Park Street Kolkata", "country": "India"},
+    ])
+    other = _df([
+        {"entity_id": "S2-00001", "business_name": "", "business_address": "Near SBI ATM 123 MG Road", "country": "India"},
+        {"entity_id": "S2-00002", "business_name": "", "business_address": "Near Metro 77 Park Street", "country": "India"},
+        {"entity_id": "S2-00003", "business_name": "", "business_address": "999 Nowhere Lane", "country": "India"},
+    ])
+    unbatched = address_token_overlap_candidates(s1, other)
+    batched = address_token_overlap_candidates(s1, other, batch_size=1)
+    assert batched == unbatched
+    assert "S2-00001" in batched["S1-00001"]
+    assert "S2-00002" in batched["S1-00002"]
 
 
 _EMBED_VOCAB = {}
