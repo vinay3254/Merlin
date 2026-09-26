@@ -24,7 +24,8 @@ import pandas as pd
 
 from src.blocking_v3 import hashed_matrix, multi_strategy_pairs, sparse_candidate_pairs
 from src.features_v3 import (
-    RecordTable, chunk_features, global_blocking_features, global_context_features, iter_global_context,
+    RecordTable, chunk_features, global_blocking_features, global_context_features, iter_global_blocking,
+    iter_global_context,
 )
 from src.infer import assign_matches
 from src.metrics import macro_f_beta
@@ -140,11 +141,9 @@ def cmd_train(args):
     tr_rows = rows_for_entities(s1_pos, train_ents)
     va_rows = rows_for_entities(s1_pos, val_ents)
     keep = np.concatenate([tr_rows, va_rows])
-    ctx = pd.concat([
-        global_blocking_features(s1_pos, other_pos, blk).iloc[keep].reset_index(drop=True),
-        global_context_features(s1_table, other_table, s1_pos, other_pos, keep_rows=keep),
-        extra_score_features(extra, keep),
-    ], axis=1)
+    ctx = {name: values[keep] for name, values in iter_global_blocking(s1_pos, other_pos, blk)}
+    ctx.update({name: values[keep] for name, values in iter_global_context(s1_table, other_table, s1_pos, other_pos)})
+    ctx = pd.concat([pd.DataFrame(ctx), extra_score_features(extra, keep)], axis=1)
     gc.collect()
     log("global context features built")
     n_tr = len(tr_rows)
@@ -193,10 +192,7 @@ def memmap_global_features(s1_table, other_table, s1_pos, other_pos, blk, extra,
     Returns (memmap, column_names).
     """
     def columns():
-        blk_df = global_blocking_features(s1_pos, other_pos, blk)
-        for col in blk_df.columns:
-            yield col, blk_df[col].to_numpy()
-        del blk_df
+        yield from iter_global_blocking(s1_pos, other_pos, blk)
         yield from iter_global_context(s1_table, other_table, s1_pos, other_pos)
         extra_df = extra_score_features(extra)
         for col in extra_df.columns:
@@ -329,7 +325,7 @@ def main(argv=None):
     t.add_argument("--dataset-dir", required=True)
     t.add_argument("--candidates", required=True)
     t.add_argument("--model-path", required=True)
-    t.add_argument("--train-entities", type=int, default=400_000)
+    t.add_argument("--train-entities", type=int, default=250_000)
     t.add_argument("--val-entities", type=int, default=60_000)
     t.add_argument("--rounds", type=int, default=1500)
     t.add_argument("--seed", type=int, default=7)

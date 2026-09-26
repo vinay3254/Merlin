@@ -132,6 +132,19 @@ def _rank_gap(keys: np.ndarray, values: np.ndarray):
     return rank, gap, size
 
 
+def iter_global_blocking(s1_pos, other_pos, blk_score):
+    """Column-at-a-time form of global_blocking_features (bounded peak memory)."""
+    yield "blk_score", blk_score.astype(np.float32)
+    rank, gap, _ = _rank_gap(s1_pos, blk_score)
+    yield "blk_rank_in_s1", rank
+    yield "blk_gap_in_s1", gap
+    del rank, gap
+    rank, gap, size = _rank_gap(other_pos, blk_score)
+    yield "blk_rank_in_other", rank
+    yield "blk_gap_in_other", gap
+    yield "blk_n_other", size
+
+
 def global_blocking_features(s1_pos: np.ndarray, other_pos: np.ndarray, blk_score: np.ndarray) -> pd.DataFrame:
     """
     Context features from the blocking score, computed over the FULL
