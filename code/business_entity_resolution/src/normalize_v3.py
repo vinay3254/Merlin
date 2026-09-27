@@ -123,6 +123,7 @@ def address_tokens(text) -> list:
     tokens = base_tokens(text)
     if not tokens:
         return []
+    tokens = canonical_regions(tokens)
     joined = " " + " ".join(tokens) + " "
     for full, code in US_STATES_MULTI.items():
         if " " + full + " " in joined:
@@ -211,3 +212,50 @@ def skeleton(token: str) -> str:
 
 def name_skeletons(core_tokens: list) -> list:
     return [s for s in (skeleton(t) for t in core_tokens) if len(s) >= 2]
+
+
+# --- Region canonicalization -------------------------------------------------
+#
+# Source 1 writes the region/state in one form; Source 2/3 often use another:
+# French départements instead of régions ("Gironde" vs "Nouvelle-Aquitaine"),
+# Indian state names in native script ("महाराष्ट्र") or as codes ("MH").
+# Mapping every form to one code keeps address similarity high for true
+# matches. Matching is on the joined base-token string (before stopword
+# removal), longest phrases first.
+REGION_PHRASES = {
+    # France: régions and their départements present in the data
+    "hauts de france": "reg_hdf", "nord": "reg_hdf", "pas de calais": "reg_hdf",
+    "nouvelle aquitaine": "reg_naq", "gironde": "reg_naq",
+    "pays de la loire": "reg_pdl", "loire atlantique": "reg_pdl",
+    # India: English names, codes, native-script names
+    "maharashtra": "st_mh", "mh": "st_mh", "महाराष्ट्र": "st_mh",
+    "delhi": "st_dl", "dl": "st_dl", "दिल्ली": "st_dl",
+    "uttar pradesh": "st_up", "up": "st_up", "उत्तर प्रदेश": "st_up",
+    "karnataka": "st_ka", "ka": "st_ka", "ಕರ್ನಾಟಕ": "st_ka",
+    "tamil nadu": "st_tn", "tamilnadu": "st_tn", "தமிழ்நாடு": "st_tn",
+    "west bengal": "st_wb", "wb": "st_wb", "পশ্চিমবঙ্গ": "st_wb",
+    "gujarat": "st_gj", "gj": "st_gj", "ગુજરાત": "st_gj",
+    "telangana": "st_tg", "tg": "st_tg", "ts": "st_tg", "తెలంగాణ": "st_tg",
+    "haryana": "st_hr", "hr": "st_hr", "हरियाणा": "st_hr",
+    "andhra pradesh": "st_ap", "ap": "st_ap", "ఆంధ్రప్రదేశ్": "st_ap",
+    "rajasthan": "st_rj", "rj": "st_rj", "राजस्थान": "st_rj",
+    "kerala": "st_kl", "keralam": "st_kl", "kl": "st_kl", "കേരളം": "st_kl",
+    "bihar": "st_br", "br": "st_br", "बिहार": "st_br",
+    "madhya pradesh": "st_mp", "mp": "st_mp", "मध्य प्रदेश": "st_mp",
+    "punjab": "st_pb", "pb": "st_pb", "ਪੰਜਾਬ": "st_pb",
+    "odisha": "st_od", "orissa": "st_od", "od": "st_od", "ଓଡ଼ିଶା": "st_od",
+}
+# Two-letter codes shared with US states ("tn", "or", "ga", ...) are left out
+# on purpose; only codes with no US meaning are mapped.
+_REGION_KEYS = sorted(REGION_PHRASES, key=lambda k: -len(k))
+
+
+def canonical_regions(tokens: list) -> list:
+    if not tokens:
+        return tokens
+    joined = " " + " ".join(tokens) + " "
+    for phrase in _REGION_KEYS:
+        needle = " " + phrase + " "
+        if needle in joined:
+            joined = joined.replace(needle, " " + REGION_PHRASES[phrase] + " ")
+    return joined.split()
