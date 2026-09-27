@@ -29,12 +29,15 @@ from src.blend_cli import _ids, _logit, blend, score_models
 from src.cross_encoder import log, read_rows, score_texts
 from src.infer import assign_matches
 from src.metrics import macro_f_beta
+from src.features_v3 import _rank_gap
 from src.normalize_v3 import address_tokens, name_parts
 from src.utils_io import write_id_mapping_tsv
 
 CONF = 0.9
 FLOOR = 0.01  # pairs below this keep their score; they are never assigned anyway
 COLS = ["logit", "sib_name", "sib_addr", "sib_max", "n_conf"]
+CONTEXT_COLS = ["rank_in_other", "gap_in_other", "n_in_other", "rank_in_s1", "gap_in_s1",
+                "n_strong_s1", "second_in_other"]
 
 
 def _norm(text):
@@ -80,6 +83,33 @@ def sibling_features(s_key, o_key, score, other_text):
     return out[COLS]
 
 
+def context_features(s_key, o_key, score):
+    """
+    Context of the final blended score: rank / gap-to-best among the S1
+    entities competing for the same record and among the entity's own
+    candidates, how many strong candidates the entity has, and the best
+    competing score for the record. Measured on validation (2-fold by
+    entity) on top of the sibling features: 0.9786 -> 0.9802.
+    """
+    sc = np.asarray(score, dtype=np.float32)
+    r_o, g_o, n_o = _rank_gap(o_key, sc)
+    r_s, g_s, _ = _rank_gap(s_key, sc)
+    n_strong = np.bincount(pd.factorize(s_key)[0], weights=(sc >= 0.5))[pd.factorize(s_key)[0]]
+    # second-highest score among the S1 entities competing for each record
+    order = np.lexsort((-sc, o_key))
+    sorted_o = o_key[order]
+    starts = np.flatnonzero(np.r_[True, sorted_o[1:] != sorted_o[:-1]])
+    sizes = np.diff(np.r_[starts, len(sc)])
+    second_per_group = np.where(sizes > 1, sc[order[np.minimum(starts + 1, len(sc) - 1)]], 0.0)
+    second = np.empty(len(sc), np.float32)
+    second[order] = np.repeat(second_per_group, sizes)
+    return pd.DataFrame({
+        "rank_in_other": r_o, "gap_in_other": g_o, "n_in_other": n_o,
+        "rank_in_s1": r_s, "gap_in_s1": g_s,
+        "n_strong_s1": n_strong.astype(np.float32), "second_in_other": second,
+    })
+
+
 def cmd_fit(args):
     import lightgbm as lgb
 
@@ -116,7 +146,9 @@ def cmd_fit(args):
     log(f"val pairs {len(f)}, uncertain re-scored {len(unsure)}")
 
     x = sibling_features(f["s"].to_numpy(), f["o"].to_numpy(), f["score"].to_numpy(), o_text)
-    log("sibling features built")
+    if args.context:
+        x = pd.concat([x, context_features(f["s"].to_numpy(), f["o"].to_numpy(), f["score"].to_numpy())], axis=1)
+    log(f"stage-2 features built: {list(x.columns)}")
     y = f["label"].to_numpy()
     ents = f["s"].unique()
     fold = pd.Series(np.random.default_rng(0).integers(0, 2, len(ents)), index=ents)[f["s"]].to_numpy()
@@ -133,7 +165,8 @@ def cmd_fit(args):
         best = max(best, (fs, float(t)))
     log(f"best stage2 {best}")
     model = make().fit(x, y)
-    joblib.dump({"model": model, "threshold": best[1], "val_f": best[0], "blend_params": params}, args.model_out)
+    joblib.dump({"model": model, "threshold": best[1], "val_f": best[0], "blend_params": params,
+                 "context": bool(args.context)}, args.model_out)
     log(f"saved {args.model_out}")
 
 
@@ -162,7 +195,12 @@ def cmd_apply(args):
     log("texts loaded")
     x = sibling_features(s_key, o_key, scores, o_text)
     del o_text
-    log("sibling features built")
+    if art.get("context"):
+        # Context is computed over the full test candidate set (every S1
+        # entity competes), with keys that identify records and entities.
+        o_full = scored["other_entity_id"].cat.codes.to_numpy()
+        x = pd.concat([x, context_features(s_key, o_full, scores)], axis=1)
+    log(f"stage-2 features built: {list(x.columns)}")
     s2 = scores.copy()
     s2[active] = art["model"].predict_proba(x[active])[:, 1]
     scored["score"] = s2
@@ -187,6 +225,7 @@ def main(argv=None):
     f.add_argument("--model-dir", required=True)
     f.add_argument("--blend-params", required=True)
     f.add_argument("--model-out", required=True)
+    f.add_argument("--context", action="store_true", help="add final-score context features")
     a = sub.add_parser("apply")
     a.add_argument("--dataset-dir", required=True)
     a.add_argument("--scores-dir", required=True, help="dir with scores.tsv.gz and candidate_pairs.tsv")
