@@ -28,8 +28,37 @@ def _logit(p):
 
 
 def blend(lgb, ce, params):
-    z = params["coef"][0] * _logit(lgb) + params["coef"][1] * _logit(ce) + params["intercept"]
+    """Logistic blend of logit(lgb) and the logits of one or more cross-encoders (ce: (n,) or (n, k))."""
+    ce = np.asarray(ce)
+    if ce.ndim == 1:
+        ce = ce[:, None]
+    z = params["coef"][0] * _logit(lgb) + params["intercept"]
+    for i in range(ce.shape[1]):
+        z = z + params["coef"][i + 1] * _logit(ce[:, i])
     return 1 / (1 + np.exp(-z))
+
+
+def score_models(model_dirs: str, text_a, text_b, caches: str = ""):
+    """
+    (n, k) scores from k comma-separated cross-encoder dirs. `caches` is an
+    optional comma-separated list of .npy files aligned with model_dirs
+    (empty entry = score with the model); a cached file must hold scores for
+    exactly these pairs in this order.
+    """
+    dirs = [d for d in model_dirs.split(",") if d]
+    cache_list = (caches.split(",") if caches else []) + [""] * len(dirs)
+    cols = []
+    for d, c in zip(dirs, cache_list):
+        if c:
+            arr = np.load(c)
+            arr = arr[:, 0] if arr.ndim == 2 else arr
+            assert len(arr) == len(text_a), f"cache {c} has {len(arr)} scores for {len(text_a)} pairs"
+            cols.append(arr)
+            log(f"loaded cached scores {c}")
+        else:
+            cols.append(score_texts(d, text_a, text_b))
+            log(f"scored with {d}")
+    return np.column_stack(cols)
 
 
 def _ids(path):
@@ -66,14 +95,15 @@ def cmd_fit(args):
     log(f"val pairs {len(frame)}, uncertain {len(unsure)}")
     s1_text = read_rows([os.path.join(d, "train_source1.tsv")], z["s1_pos"][unsure])
     o_text = read_rows(other_paths, z["other_pos"][unsure])
-    ce = score_texts(args.model_dir, [s1_text[int(p)] for p in z["s1_pos"][unsure]],
-                     [o_text[int(p)] for p in z["other_pos"][unsure]])
+    ce = score_models(args.model_dir, [s1_text[int(p)] for p in z["s1_pos"][unsure]],
+                      [o_text[int(p)] for p in z["other_pos"][unsure]])
     lgb = frame["score"].to_numpy()[unsure]
     y = frame["label"].to_numpy()[unsure]
-    reg = LogisticRegression(C=10.0).fit(np.column_stack([_logit(lgb), _logit(ce)]), y)
+    reg = LogisticRegression(C=10.0).fit(np.column_stack([_logit(lgb)] + [_logit(ce[:, i]) for i in range(ce.shape[1])]), y)
     params = {"coef": reg.coef_[0].tolist(), "intercept": float(reg.intercept_[0]), "lo": args.lo, "hi": args.hi}
     log(f"blend params {params}")
-    log(f"uncertain-pair accuracy: lgb {((lgb >= 0.5) == y).mean():.4f} ce {((ce >= 0.5) == y).mean():.4f} "
+    log(f"uncertain-pair accuracy: lgb {((lgb >= 0.5) == y).mean():.4f} "
+        f"ce {[round(float(((ce[:, i] >= 0.5) == y).mean()), 4) for i in range(ce.shape[1])]} "
         f"blend {((blend(lgb, ce, params) >= 0.5) == y).mean():.4f}")
 
     thresholds = np.arange(0.3, 0.91, 0.05)
@@ -111,7 +141,7 @@ def cmd_apply(args):
     s1_text = read_rows([s1_path], sp)
     o_text = read_rows(other_paths, op)
     log("texts loaded")
-    ce = score_texts(args.model_dir, [s1_text[int(p)] for p in sp], [o_text[int(p)] for p in op])
+    ce = score_models(args.model_dir, [s1_text[int(p)] for p in sp], [o_text[int(p)] for p in op], args.ce_cache)
     del s1_text, o_text
     os.makedirs(args.output_dir, exist_ok=True)
     np.save(os.path.join(args.output_dir, "ce_scores_uncertain.npy"), ce)
@@ -147,6 +177,7 @@ def main(argv=None):
     a.add_argument("--params", required=True)
     a.add_argument("--output-dir", required=True)
     a.add_argument("--threshold", type=float, default=None)
+    a.add_argument("--ce-cache", default="", help="comma list of .npy score caches aligned with --model-dir")
     args = parser.parse_args(argv)
     {"fit": cmd_fit, "apply": cmd_apply}[args.cmd](args)
 

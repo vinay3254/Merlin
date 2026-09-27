@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-from src.blend_cli import _ids, _logit, blend
+from src.blend_cli import _ids, _logit, blend, score_models
 from src.cross_encoder import log, read_rows, score_texts
 from src.infer import assign_matches
 from src.metrics import macro_f_beta
@@ -108,8 +108,8 @@ def cmd_fit(args):
     unsure = np.flatnonzero((f["score"] > params["lo"]) & (f["score"] < params["hi"]))
     s1_text = read_rows([os.path.join(d, "train_source1.tsv")], f["s"].to_numpy()[unsure])
     o_text = read_rows(other_paths, f["o"].unique())
-    ce = score_texts(args.model_dir, [s1_text[int(p)] for p in f["s"].to_numpy()[unsure]],
-                     [o_text[int(p)] for p in f["o"].to_numpy()[unsure]])
+    ce = score_models(args.model_dir, [s1_text[int(p)] for p in f["s"].to_numpy()[unsure]],
+                      [o_text[int(p)] for p in f["o"].to_numpy()[unsure]])
     blended = f["score"].to_numpy().copy()
     blended[unsure] = blend(blended[unsure], ce, params)
     f["score"] = blended
