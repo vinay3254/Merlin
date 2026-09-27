@@ -124,11 +124,32 @@ def pair_features(s1: RecordTable, other: RecordTable, s1_pos: np.ndarray, other
 
 
 def _rank_gap(keys: np.ndarray, values: np.ndarray):
-    frame = pd.DataFrame({"k": keys, "v": values})
-    grouped = frame.groupby("k")["v"]
-    rank = grouped.rank(ascending=False, method="min").to_numpy(np.float32)
-    gap = (grouped.transform("max") - frame["v"]).to_numpy(np.float32)
-    size = grouped.transform("size").to_numpy(np.float32)
+    """
+    Per-group descending rank (ties broken by position), gap to the group
+    max, and group size -- in numpy via one lexsort, because pandas groupby
+    rank over ~140M rows needs several extra full-length int64 buffers and
+    pushed a 15GB machine into heavy swapping.
+    """
+    n = len(keys)
+    if n == 0:
+        empty = np.zeros(0, dtype=np.float32)
+        return empty, empty, empty
+    values = np.asarray(values, dtype=np.float32)
+    order = np.lexsort((-values, keys))
+    sorted_keys = keys[order]
+    starts = np.flatnonzero(np.r_[True, sorted_keys[1:] != sorted_keys[:-1]])
+    del sorted_keys
+    sizes = np.diff(np.r_[starts, n])
+    group_start = np.repeat(starts, sizes)
+    rank = np.empty(n, dtype=np.float32)
+    rank[order] = (np.arange(n) - group_start + 1).astype(np.float32)
+    del group_start
+    group_max = np.repeat(values[order[starts]], sizes)
+    gap = np.empty(n, dtype=np.float32)
+    gap[order] = group_max - values[order]
+    del group_max
+    size = np.empty(n, dtype=np.float32)
+    size[order] = np.repeat(sizes, sizes).astype(np.float32)
     return rank, gap, size
 
 
@@ -211,9 +232,9 @@ def iter_global_context(s1: RecordTable, other: RecordTable, s1_pos, other_pos, 
             del gap
     del addr_ts
     near_identical = (name_best >= 90).astype(np.float32)
-    yield "gname_n_near_identical_in_other", (
-        pd.Series(near_identical).groupby(other_pos).transform("sum").to_numpy(np.float32)
-    )
+    counts = np.bincount(other_pos, weights=near_identical)
+    yield "gname_n_near_identical_in_other", counts[other_pos].astype(np.float32)
+    del counts
     yield "gname_best", name_best
 
 

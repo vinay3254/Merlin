@@ -327,7 +327,7 @@ def main(argv=None):
     t.add_argument("--dataset-dir", required=True)
     t.add_argument("--candidates", required=True)
     t.add_argument("--model-path", required=True)
-    t.add_argument("--train-entities", type=int, default=250_000)
+    t.add_argument("--train-entities", type=int, default=200_000)
     t.add_argument("--val-entities", type=int, default=60_000)
     t.add_argument("--rounds", type=int, default=1500)
     t.add_argument("--seed", type=int, default=7)
