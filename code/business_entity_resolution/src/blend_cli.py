@@ -113,6 +113,7 @@ def cmd_apply(args):
     log("texts loaded")
     ce = score_texts(args.model_dir, [s1_text[int(p)] for p in sp], [o_text[int(p)] for p in op])
     del s1_text, o_text
+    os.makedirs(args.output_dir, exist_ok=True)
     np.save(os.path.join(args.output_dir, "ce_scores_uncertain.npy"), ce)
     scores = scored["score"].to_numpy().copy()
     scores[unsure] = blend(scores[unsure], ce, params)
