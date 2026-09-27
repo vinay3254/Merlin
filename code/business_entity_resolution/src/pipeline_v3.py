@@ -204,7 +204,11 @@ def memmap_global_features(s1_table, other_table, s1_pos, other_pos, blk, extra,
     names += [n for n, _ in iter_global_context_names()]
     names += list(extra_score_features(extra[:1] if extra is not None else None).columns)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    mm = np.lib.format.open_memmap(path + ".npy", mode="w+", dtype=np.float32, shape=(len(s1_pos), len(names)))
+    # Column-major: each feature column is written as one contiguous block
+    # (row-major made every column write touch the whole multi-GB file), and
+    # reading a chunk of rows is still one contiguous slice per column.
+    mm = np.lib.format.open_memmap(path + ".npy", mode="w+", dtype=np.float32,
+                                   shape=(len(s1_pos), len(names)), fortran_order=True)
     for col, values in columns():
         mm[:, names.index(col)] = values
         del values
@@ -230,10 +234,11 @@ class GlobalRows:
 
     def iloc_rows(self, rows):
         idx = self.order[rows]
-        sort = np.argsort(idx)
-        block = np.empty((len(idx), len(self.names)), dtype=np.float32)
-        block[sort] = self.mm[idx[sort]]
-        return pd.DataFrame(block, columns=self.names)
+        lo, hi = int(idx.min()), int(idx.max()) + 1
+        # Rows of a chunk are near-contiguous (candidates are stored sorted by
+        # S1 position), so read one slice per column and index into it.
+        cols = {name: np.asarray(self.mm[lo:hi, j])[idx - lo] for j, name in enumerate(self.names)}
+        return pd.DataFrame(cols)
 
 
 def cmd_infer(args):
