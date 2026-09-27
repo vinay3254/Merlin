@@ -95,8 +95,9 @@ def cmd_apply(args):
     d = args.dataset_dir
     with open(args.params) as f:
         params = json.load(f)
+    # Categorical ids: ~70M rows of Python id strings would take ~10GB.
     scored = pd.read_csv(os.path.join(args.scores_dir, "scores.tsv.gz"), sep="\t", keep_default_na=False,
-                         dtype={"source1_entity_id": str, "other_entity_id": str, "score": np.float32})
+                         dtype={"source1_entity_id": "category", "other_entity_id": "category", "score": np.float32})
     unsure = np.flatnonzero((scored["score"] > params["lo"]) & (scored["score"] < params["hi"]))
     log(f"test pairs {len(scored)}, uncertain {len(unsure)}")
     s1_path = os.path.join(d, "test_source1.tsv")
@@ -105,8 +106,8 @@ def cmd_apply(args):
     other_ids = np.concatenate([_ids(p) for p in other_paths])
     s1_index = pd.Series(np.arange(len(s1_ids)), index=s1_ids)
     o_index = pd.Series(np.arange(len(other_ids)), index=other_ids)
-    sp = s1_index[scored["source1_entity_id"].to_numpy()[unsure]].to_numpy()
-    op = o_index[scored["other_entity_id"].to_numpy()[unsure]].to_numpy()
+    sp = s1_index[scored["source1_entity_id"].to_numpy()[unsure].astype(str)].to_numpy()
+    op = o_index[scored["other_entity_id"].to_numpy()[unsure].astype(str)].to_numpy()
     s1_text = read_rows([s1_path], sp)
     o_text = read_rows(other_paths, op)
     log("texts loaded")
@@ -118,6 +119,7 @@ def cmd_apply(args):
     scored["score"] = scores
     threshold = args.threshold if args.threshold is not None else params["threshold"]
     matches = assign_matches(scored, threshold)
+    matches = {str(k): [str(v) for v in vs] for k, vs in matches.items()}
     for eid in s1_ids:
         matches.setdefault(eid, [])
     os.makedirs(args.output_dir, exist_ok=True)

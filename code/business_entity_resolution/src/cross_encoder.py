@@ -186,14 +186,25 @@ def score_texts(model_dir, text_a, text_b, model=None, tokenizer=None, batch_siz
         tokenizer = AutoTokenizer.from_pretrained(model_dir)
         model = AutoModelForSequenceClassification.from_pretrained(model_dir).cuda()
     model.eval()
+    # Length-sorted batches: padding to each batch's longest pair wastes most
+    # of the compute when short and long records are mixed.
+    order = np.argsort([len(a) + len(b) for a, b in zip(text_a, text_b)], kind="stable")
+    sorted_a = [text_a[i] for i in order]
+    sorted_b = [text_b[i] for i in order]
     out = []
     with torch.no_grad():
-        for enc, _ in _batches(tokenizer, text_a, text_b, None, batch_size, shuffle=False):
+        for i, (enc, _) in enumerate(_batches(tokenizer, sorted_a, sorted_b, None, batch_size, shuffle=False)):
             enc = {k: v.cuda() for k, v in enc.items()}
             with torch.autocast("cuda", dtype=torch.float16):
                 logits = model(**enc).logits.squeeze(-1)
             out.append(torch.sigmoid(logits.float()).cpu().numpy())
-    return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+            if i % 1000 == 0 and i:
+                log(f"scored {i * batch_size}/{len(order)}")
+    if not out:
+        return np.zeros(0, dtype=np.float32)
+    probs = np.empty(len(order), dtype=np.float32)
+    probs[order] = np.concatenate(out)
+    return probs
 
 
 def cmd_score(args):
