@@ -34,6 +34,7 @@ from src.normalize_v3 import address_tokens, name_parts
 from src.utils_io import write_id_mapping_tsv
 
 CONF = 0.9
+SAVE_FLOOR = 0.2
 FLOOR = 0.01  # pairs below this keep their score; they are never assigned anyway
 COLS = ["logit", "sib_name", "sib_addr", "sib_max", "n_conf"]
 CONTEXT_COLS = ["rank_in_other", "gap_in_other", "n_in_other", "rank_in_s1", "gap_in_s1",
@@ -204,16 +205,49 @@ def cmd_apply(args):
     s2 = scores.copy()
     s2[active] = art["model"].predict_proba(x[active])[:, 1]
     scored["score"] = s2
+    if args.save_scores:
+        # Only pairs that any sensible threshold could keep; enough to re-threshold later.
+        scored[scored["score"] >= SAVE_FLOOR].to_csv(args.save_scores, sep="\t", index=False)
+        log(f"saved final scores to {args.save_scores}")
     threshold = args.threshold if args.threshold is not None else art["threshold"]
+    write_output(scored, threshold, d, args.scores_dir, args.output_dir)
+    log(f"wrote {args.output_dir} at threshold {threshold}")
+
+
+def write_output(scored, threshold, dataset_dir, candidates_dir, output_dir):
+    """threshold is a scalar or a per-row array aligned with scored."""
     matches = assign_matches(scored, threshold)
     matches = {str(k): [str(v) for v in vs] for k, vs in matches.items()}
-    for eid in _ids(os.path.join(d, "test_source1.tsv")):
+    for eid in _ids(os.path.join(dataset_dir, "test_source1.tsv")):
         matches.setdefault(eid, [])
-    os.makedirs(args.output_dir, exist_ok=True)
-    write_id_mapping_tsv(matches, os.path.join(args.output_dir, "matching_results.tsv"),
+    os.makedirs(output_dir, exist_ok=True)
+    write_id_mapping_tsv(matches, os.path.join(output_dir, "matching_results.tsv"),
                          id_col="source1_entity_id", list_col="matched_entity_ids")
-    shutil.copy(os.path.join(args.scores_dir, "candidate_pairs.tsv"), os.path.join(args.output_dir, "candidate_pairs.tsv"))
-    log(f"wrote {args.output_dir} at threshold {threshold}")
+    shutil.copy(os.path.join(candidates_dir, "candidate_pairs.tsv"), os.path.join(output_dir, "candidate_pairs.tsv"))
+
+
+def country_thresholds(scored, s1_path, default, overrides):
+    """Per-row threshold: overrides maps country -> threshold for that S1 entity's country."""
+    s1 = pd.read_csv(s1_path, sep="\t", usecols=["entity_id", "country"], dtype=str,
+                     keep_default_na=False, quoting=3)
+    by_id = pd.Series(s1["country"].to_numpy(), index=s1["entity_id"].to_numpy())
+    country = by_id.reindex(scored["source1_entity_id"].astype(str).to_numpy()).to_numpy()
+    thr = np.full(len(scored), default, dtype=np.float64)
+    for c, t in overrides.items():
+        thr[country == c] = t
+    return thr
+
+
+def cmd_threshold(args):
+    scored = pd.read_csv(args.final_scores, sep="\t", keep_default_na=False,
+                         dtype={"source1_entity_id": "category", "other_entity_id": "category", "score": np.float64})
+    overrides = {}
+    for item in args.country_threshold:
+        c, t = item.rsplit("=", 1)
+        overrides[c] = float(t)
+    thr = country_thresholds(scored, os.path.join(args.dataset_dir, "test_source1.tsv"), args.threshold, overrides)
+    write_output(scored, thr, args.dataset_dir, args.candidates_dir, args.output_dir)
+    log(f"wrote {args.output_dir} at threshold {args.threshold}, overrides {overrides}")
 
 
 def main(argv=None):
@@ -233,8 +267,16 @@ def main(argv=None):
     a.add_argument("--stage2-model", required=True)
     a.add_argument("--output-dir", required=True)
     a.add_argument("--threshold", type=float, default=None)
+    a.add_argument("--save-scores", default=None, help="write final pair scores (>= 0.2) to this .tsv.gz")
+    t = sub.add_parser("threshold", help="re-threshold saved final scores, optionally per country")
+    t.add_argument("--dataset-dir", required=True)
+    t.add_argument("--final-scores", required=True, help="file from apply --save-scores")
+    t.add_argument("--candidates-dir", required=True, help="dir with candidate_pairs.tsv")
+    t.add_argument("--output-dir", required=True)
+    t.add_argument("--threshold", type=float, required=True)
+    t.add_argument("--country-threshold", action="append", default=[], help="e.g. France=0.7 (repeatable)")
     args = parser.parse_args(argv)
-    {"fit": cmd_fit, "apply": cmd_apply}[args.cmd](args)
+    {"fit": cmd_fit, "apply": cmd_apply, "threshold": cmd_threshold}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,42 @@
+name: Submission Validator Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  validate-submission-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test Validator on Synthetic Sample
+        run: |
+          mkdir -p /tmp/dummy_test /tmp/dummy_out
+          
+          # Create synthetic test_source1.tsv
+          printf "source1_entity_id\tname\taddress\nS1-001\tAcme Corp\t123 Main St\nS1-002\tGlobex Inc\t456 Market St\n" > /tmp/dummy_test/test_source1.tsv
+          printf "source2_entity_id\tname\taddress\nS2-001\tAcme\t123 Main\n" > /tmp/dummy_test/test_source2.tsv
+          printf "source3_entity_id\tname\taddress\nS3-001\tGlobex\t456 Market\n" > /tmp/dummy_test/test_source3.tsv
+          
+          # Create matching_results.tsv
+          printf "source1_entity_id\tmatched_entity_ids\nS1-001\tS2-001\nS1-002\tS3-001\n" > /tmp/dummy_out/matching_results.tsv
+          
+          # Create candidate_pairs.tsv
+          printf "source1_entity_id\tcandidate_entity_ids\nS1-001\tS2-001\nS1-002\tS3-001\n" > /tmp/dummy_out/candidate_pairs.tsv
+          
+          # Run validator
+          python3 student_resource/utils/validate_submission.py \
+            --matching /tmp/dummy_out/matching_results.tsv \
+            --candidate /tmp/dummy_out/candidate_pairs.tsv \
+            --test-dir /tmp/dummy_test \
+            --check-ids

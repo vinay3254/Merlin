@@ -47,3 +47,10 @@ htmlcov/
 # Logs and training run artifacts
 *.log
 catboost_info/
+
+# Model weights and prediction dumps
+*.joblib
+*.npz
+output*/
+ce*/
+v3/
