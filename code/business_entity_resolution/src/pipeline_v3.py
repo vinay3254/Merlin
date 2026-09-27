@@ -170,6 +170,8 @@ def cmd_train(args):
         "other_entity_id": other_ids[other_pos[va_rows]],
         "score": model.predict_proba(x_va[feature_columns])[:, 1],
     })
+    np.savez(args.model_path + ".val.npz", s1_pos=s1_pos[va_rows], other_pos=other_pos[va_rows],
+             score=scored["score"].to_numpy(np.float32), label=y_va, val_ents=val_ents)
     val_truth = {s1_ids[p]: truth.get(s1_ids[p], set()) for p in val_ents}
     best = (0.0, 0.5)
     for threshold in np.arange(0.2, 0.9, 0.05):
